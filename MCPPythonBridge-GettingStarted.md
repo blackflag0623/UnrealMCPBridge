@@ -170,6 +170,64 @@ These tools are defined in `unreal_mcp_client.py` and are available to the AI ag
 |------|-----------|-------------|
 | `run_blueprint_function` | `blueprint_name`, `function_name`, `arguments` | Executes a function defined in a Blueprint. Arguments are passed as a comma-separated string. |
 
+### Blueprint Graph Authoring (Reads)
+
+These tools introspect a Blueprint's graphs without `execute_python`. Together they let an agent walk an event graph or function graph node-by-node, follow exec/data pin connections, and read every kind of node reference. `blueprint_path` is an asset path like `/Game/BP/BP_NPC.BP_NPC` (or just `/Game/BP/BP_NPC` — both resolve). `node_id` strings come from a list call (`get_node_ids`); IDs may shift after compile, so re-introspect rather than caching them.
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `get_node_ids` | `blueprint_path` | Returns the node IDs in the BP's event graph (JSON list). |
+| `get_node_ids_in_graph` | `blueprint_path`, `graph_name` | Returns node IDs in a named graph (event graph, user function, or macro). |
+| `get_pin_names` | `blueprint_path`, `node_id` | Returns the internal pin names on a node ("execute", "then", "ReturnValue", etc.). |
+| `get_pin_details` | `blueprint_path`, `node_id` | Returns pin info as `"PinName\|Direction\|Type"` strings (Input/Output, exec/bool/int/struct/object/...). |
+| `get_node_title` | `blueprint_path`, `node_id` | Returns the human-readable list-view title (e.g., "Print String", "Branch", "Get MyVar"). |
+| `get_function_reference` | `blueprint_path`, `node_id` | For a `K2Node_CallFunction`, returns `"MemberParent::MemberName"` (e.g., `"KismetSystemLibrary::PrintString"`). Empty for non-call nodes. |
+| `get_event_reference` | `blueprint_path`, `node_id` | For `K2Node_Event` returns `"Class::Member"`; for `K2Node_CustomEvent` returns the custom event name. |
+| `get_variable_reference` | `blueprint_path`, `node_id` | For `K2Node_VariableGet` / `K2Node_VariableSet`, returns the variable name. |
+| `get_macro_reference` | `blueprint_path`, `node_id` | For `K2Node_MacroInstance`, returns `"Library::MacroName"`. |
+| `get_pin_connections` | `blueprint_path`, `node_id`, `pin_name` | Returns the linked-to pins as `"OtherNodeId.OtherPinName"` strings (JSON list). The key function for walking a graph: follow exec pins for control flow, follow data pins for value flow. Silent no-op if the pin doesn't exist on the node. |
+| `get_pin_default_value` | `blueprint_path`, `node_id`, `pin_name` | Returns the default literal of an unconnected input pin. For object/class pins returns the asset path; for value pins returns the literal string. |
+| `get_function_graph_names` | `blueprint_path` | Lists user-defined function graphs on a BP. Pair with `get_node_ids_in_graph` to walk them. |
+| `get_macro_graph_names` | `blueprint_path` | Lists macro graphs on a BP. |
+| `get_member_variable_names` | `blueprint_path` | Lists member variables (`NewVariables` — distinct from components and from variable nodes that reference them). |
+| `get_member_variable_type` | `blueprint_path`, `variable_name` | Returns a richer type string: primitives as-is (`int`, `double`), or `struct:Name`, `object:/Path`, `class:/Path`, `enum:Name`, `TArray<...>`, `TSet<...>`, `TMap<K,V>`. |
+| `get_function_metadata` | `blueprint_path`, `function_graph_name` | Returns `"Category\|Access\|Pure\|Const"`. Access ∈ {Public, Protected, Private}. |
+| `get_function_parameters` | `blueprint_path`, `function_graph_name` | Returns input/output parameters as `"Name\|Direction\|Type\|DefaultValue"` strings. Direction ∈ {Input, Output}. DefaultValue is empty for outputs. |
+| `get_overridable_functions` | `blueprint_path` | Lists parent-class `BlueprintEvent` functions that aren't yet overridden — i.e., what events the BP could implement but doesn't. |
+| `get_component_template_names` | `blueprint_path` | Lists Simple Construction Script (SCS) component variable names. |
+| `get_component_template_class` | `blueprint_path`, `component_name` | Returns the class name of an SCS component (e.g., `"StaticMeshComponent"`). |
+
+### Blueprint Graph Authoring (Writes)
+
+These tools build BP graphs without `execute_python`. The typical authoring sequence is: create BP → add events/calls/variables → wire pins → set defaults → compile and save. Node IDs returned by `add_*_node` tools are stable until the next compile.
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `create_new_blueprint` | `path`, `name`, `parent_class_path` | Creates a new BP asset. Returns its full asset path (e.g., `/Game/BP/BP_MyActor.BP_MyActor`). New BPs are created with default `BeginPlay` / `Tick` / `ActorBeginOverlap` events already present — find them via `get_node_ids` rather than adding duplicates. |
+| `add_event_node` | `blueprint_path`, `event_name`, `pos_x`, `pos_y` | Adds an event node (e.g., `"ReceiveDestroyed"`). Avoid duplicating BeginPlay/Tick — they already exist on new BPs. |
+| `add_call_function_node` | `blueprint_path`, `target_class_path`, `function_name`, `pos_x`, `pos_y` | Adds a function call. `target_class_path` examples: `/Script/Engine.KismetSystemLibrary`, `/Script/Engine.KismetMathLibrary`, or any BP class path. |
+| `add_spawn_actor_node` | `blueprint_path`, `actor_class_path`, `pos_x`, `pos_y` | Adds the canonical `UK2Node_SpawnActorFromClass`. The class is pinned and `ExposeOnSpawn` properties materialize as input pins automatically. Also auto-spawns a `Make Transform` helper node (KismetMathLibrary call) wired into `SpawnTransform`, because that pin is by-ref and the K2 compiler rejects an unconnected one. Edit the Make Transform's Location/Rotation/Scale sub-pins to set a non-identity spawn transform, or replace it with your own input. |
+| `add_variable_get_node` | `blueprint_path`, `variable_name`, `pos_x`, `pos_y` | Adds a variable Get node. Variable must already exist (via `add_variable`). |
+| `add_variable_set_node` | `blueprint_path`, `variable_name`, `pos_x`, `pos_y` | Adds a variable Set node. Variable must already exist. |
+| `add_branch_node` | `blueprint_path`, `pos_x`, `pos_y` | Adds an if/else `Branch` node. |
+| `add_custom_event_node` | `blueprint_path`, `event_name`, `pos_x`, `pos_y` | Adds a Custom Event entry point callable from BP code. |
+| `connect_pins` | `blueprint_path`, `source_node_id`, `source_pin`, `target_node_id`, `target_pin` | Wires two pins (exec or data). Use the internal pin names (`"then"`, `"execute"`, `"ReturnValue"`, etc.) — call `get_pin_names` first if unsure. |
+| `set_pin_default_value` | `blueprint_path`, `node_id`, `pin_name`, `value` | Sets a literal default on an unconnected input. For object/class pins pass an asset path (`"/Game/BP/BP_NPC.BP_NPC_C"`). |
+| `add_variable` | `blueprint_path`, `name`, `type_name`, `instance_editable` | Adds a member variable. Type names: `bool`, `int`, `float`, `string`, `name`, `text`, `Vector`, `Rotator`, `Transform`, or a class path. |
+| `add_function_graph` | `blueprint_path`, `graph_name` | Creates a new user-defined function graph on the BP (empty FunctionEntry, no parameters yet). |
+| `add_function_parameter` | `blueprint_path`, `function_graph_name`, `param_name`, `type_name`, `is_input`, `default_value` | Adds an input or output parameter to a function graph. If adding the first output, a `FunctionResult` node is auto-spawned. |
+| `compile_and_save_blueprint` | `blueprint_path` | Compiles the BP and writes to disk. Returns `"True"` on success without errors. Call once at the end of an authoring sequence. |
+
+### PIE Control
+
+Drive Play-In-Editor sessions programmatically — no toolbar clicks. Useful for net trace capture, automation tests, AI/replication smoke tests.
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `start_pie` | `net_mode`, `num_clients` | Starts PIE. `net_mode` ∈ `{"standalone", "listen_server", "client"}`. `num_clients` ≥ 1. Sets `ULevelEditorPlaySettings::PlayNetMode` + `PlayNumberOfClients`, then calls `LevelEditorSubsystem::EditorRequestBeginPlay`. PIE start is async — verify with `is_pie_running`. |
+| `stop_pie` | — | Stops the active PIE session. |
+| `is_pie_running` | — | Returns `"True"` if a PIE world is currently active. |
+
 ### Viewport & Screenshots
 
 | Tool | Parameters | Description |
@@ -181,6 +239,8 @@ These tools are defined in `unreal_mcp_client.py` and are available to the AI ag
 ### CSV Profiler (High-Level Performance)
 
 The CSV profiler captures per-frame aggregate stats — frame time, thread times, GPU time, draw calls, memory — without the overhead of a full Insights trace. Use it as a quick health check to identify *which area* has a problem, then follow up with Insights tracing to find the *specific cause*.
+
+> **UE 5.5 limitation:** do not run the CSV profiler and an Insights trace concurrently — together they trip an engine assertion (`CsvProfilerProvider.cpp:170`, `CurrentCapture` failed) and crash the editor. UE 5.6 and 5.7 are unaffected. On 5.5 use them sequentially: capture one, stop, then capture the other.
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
@@ -218,11 +278,14 @@ Insights tracing captures the full call stack — individual function names, sou
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `start_trace` | — | Starts capturing an Unreal Insights trace to file. Captures CPU, GPU, Frame, Counters, and Region channels. Call `stop_trace` when done. |
+| `start_trace` | — | Starts capturing an Unreal Insights trace to file. Captures CPU, GPU, Frame, Counters, Region, and **Net** channels. Also issues `NetTrace.SetTraceVerbosity 2` so net events actually emit (the channel alone isn't enough — runtime verbosity must be non-zero). Call `stop_trace` when done. |
 | `stop_trace` | — | Stops the current trace capture. Returns the absolute path to the `.utrace` file. |
 | `analyze_trace` | `trace_path`, `top_n` | Parses a `.utrace` file and returns a JSON summary including: trace duration, thread info, frame statistics (avg/min/max FPS), and the top N most expensive timing scopes sorted by total inclusive time. Each scope includes name, source file/line, call count, and total/avg/max inclusive time in milliseconds. Default `top_n` = 50. |
 | `get_trace_spikes` | `trace_path`, `budget_ms`, `max_frames`, `top_scopes_per_frame` | Finds frames that exceeded a time budget. For each spike frame, returns the top timing scopes contributing to that frame. Default budget = 33.33ms (30fps). |
 | `get_trace_frame_summary` | `trace_path` | Returns frame timing statistics from a `.utrace` file: frame count, avg/min/max frame time, FPS, percentiles (p50/p90/p95/p99), and counts of frames exceeding 60fps and 30fps budgets. |
+| `get_trace_net_summary` | `trace_path`, `top_n` | Parses the Net channel: per-connection packet/byte totals (in/out + drop rate), top objects by outbound bandwidth (which actors send the most data), top event types by outbound bandwidth (which RPCs / replicated properties dominate), and game-instance metadata (server vs client, Iris on/off). Reports `has_net_data: false` cleanly for non-networked traces. |
+
+> **UE 5.5 limitation:** see the CSV Profiler note above — don't run a trace and CSV profile concurrently on UE 5.5 (engine assertion crash). Use them sequentially. UE 5.6 and 5.7 are fine.
 
 ### Python Execution
 
@@ -243,16 +306,17 @@ Prompts are pre-written instructions that guide the agent through a multi-step w
 
 You can add your own prompts by following the pattern in the "Developing New Tools and Prompts" section below.
 
-## C++ Libraries (via execute_python)
+## C++ Libraries
 
-The plugin bundles four C++ `BlueprintFunctionLibrary` classes that auto-reflect to Python when the plugin is loaded. These are accessed via `execute_python` using `import unreal`:
+The plugin bundles five C++ `BlueprintFunctionLibrary` classes that auto-reflect to Python when the plugin is loaded. Most of `BlueprintGraphLibrary`, `TraceAnalysisLibrary`, and `PIEControlLibrary` is now exposed as dedicated MCP tools (see the tool tables above). The `execute_python` tool can also reach them directly via `import unreal`.
 
 | Library | Python Access | Purpose |
 |---------|--------------|---------|
-| `BlueprintGraphLibrary` | `unreal.BlueprintGraphLibrary` | Create Blueprint assets, add event/function/variable nodes, wire exec and data pins, compile and save. |
-| `NiagaraEditorLibrary` | `unreal.NiagaraEditorLibrary` | Create Niagara particle systems, add emitters and modules, set parameters, configure renderers (Sprite/Ribbon/Light/Mesh/Decal), compile. |
+| `BlueprintGraphLibrary` | `unreal.BlueprintGraphLibrary` | Read and write Blueprint graphs: create BPs, add event/function/variable/branch/spawn-actor/macro nodes, wire pins, set defaults, author user function graphs with typed parameters, compile and save. Also full introspection — node titles, function/event/variable references, pin connections and defaults, function metadata, override-able parent functions, member variables, SCS components. **Most operations are exposed as dedicated MCP tools** under "Blueprint Graph Authoring". |
+| `NiagaraEditorLibrary` | `unreal.NiagaraEditorLibrary` | Create Niagara particle systems, add emitters and modules, set parameters, configure renderers (Sprite/Ribbon/Light/Mesh/Decal), compile. Used via `execute_python`. |
 | `ViewportCaptureLibrary` | `unreal.ViewportCaptureLibrary` | Synchronous viewport screenshot capture via ReadPixels. Used internally by `take_screenshot`. |
-| `TraceAnalysisLibrary` | `unreal.TraceAnalysisLibrary` | Parse Unreal Insights `.utrace` files — extract timing scopes, frame stats, thread info. Used internally by `analyze_trace`, `get_trace_spikes`, `get_trace_frame_summary`. |
+| `TraceAnalysisLibrary` | `unreal.TraceAnalysisLibrary` | Parse Unreal Insights `.utrace` files — timing scopes, frame stats, thread info, **and Net channel events** (per-connection bytes/packets, top objects/event types by replication bandwidth) via `INetProfilerProvider`. Used internally by `analyze_trace`, `get_trace_spikes`, `get_trace_frame_summary`, `get_trace_net_summary`. |
+| `PIEControlLibrary` | `unreal.PIEControlLibrary` | Start, stop, and query Play-In-Editor sessions with optional multiplayer config. Wraps `ULevelEditorPlaySettings` + `LevelEditorSubsystem`. Exposed as `start_pie` / `stop_pie` / `is_pie_running` MCP tools. |
 
 ## Developing New Tools and Prompts
 
@@ -313,32 +377,36 @@ You must restart Claude for any changes to `unreal_mcp_client.py` to take effect
 
 The `execute_python` tool gives the agent access to the full Unreal Engine Python API, including the C++ wrapper libraries bundled with this plugin (see table above).
 
-### Creating Blueprints
+### Creating and Editing Blueprints
 
-Ask the agent to create a Blueprint and it will use `execute_python` to call `BlueprintGraphLibrary` functions. The library supports creating Actor Blueprints, adding event nodes (BeginPlay, Tick, custom events), function call nodes, variables, branch logic, and pin connections — including exec pin wiring on event nodes.
+Ask the agent to author or modify a Blueprint and it can do everything end-to-end with the dedicated MCP tools (see "Blueprint Graph Authoring" tables above) — no `execute_python` needed for graph work. The typical authoring sequence is:
 
-**Example prompt for Claude Desktop** — add this to `unreal_mcp_client.py`:
+1. `create_new_blueprint` to create the asset
+2. `add_variable` for any member variables
+3. `get_node_ids` + `get_event_reference` to find existing default events (BeginPlay/Tick/ActorBeginOverlap are auto-created on new BPs)
+4. `add_call_function_node` / `add_spawn_actor_node` / `add_branch_node` / etc. to add new nodes
+5. `connect_pins` to wire exec and data pins
+6. `set_pin_default_value` to set literal inputs
+7. `compile_and_save_blueprint`
+8. Read it back via `get_node_ids` + `get_node_title` + `get_function_reference` + `get_pin_connections` to verify.
 
-```python
-@mcp.prompt()
-def create_rotating_actor() -> str:
-    """Create a Blueprint actor that rotates continuously"""
-    return f"""
-Create a Blueprint actor that rotates continuously using the BlueprintGraphLibrary.
-Use execute_python with `import unreal` and `unreal.BlueprintGraphLibrary` to:
-1. Create a new Blueprint at /Game/Blueprints/BP_Rotator with Actor as the parent class.
-2. Add a ReceiveBeginPlay event node.
-3. Add a call to SetActorRotation or AddActorLocalRotation.
-4. Add a variable for rotation speed (float, instance editable, default 1.0).
-5. Connect the event to the function call.
-6. Compile and save the Blueprint.
-7. Spawn an instance of the Blueprint into the level.
-"""
-```
+For introspecting *existing* Blueprints — listing function graphs, reading parameter signatures, finding which events are overridden, walking exec/data flow — use the read tools (`get_function_graph_names`, `get_function_parameters`, `get_overridable_functions`, `get_pin_connections`, etc.). Useful before modifying a BP so the agent doesn't duplicate or clobber existing logic.
 
 **Example prompt for Claude Code** — type directly in the conversation:
 
 > Create a Blueprint at /Game/Blueprints/BP_DayNightCycle that has a public float variable called "CycleSpeed" and a DirectionalLight reference variable called "SunLight". On BeginPlay it should print "Day/Night cycle started" to the screen.
+
+**Example: defining a typed function on a Blueprint**
+
+> On /Game/BP/BP_NPC, add a user function "ComputeDamage" with inputs (BaseDamage: float = 10.0, ArmorClass: int) and output (Result: float). Then compile and save.
+
+This translates to `add_function_graph("/Game/BP/BP_NPC", "ComputeDamage")` followed by three `add_function_parameter` calls and a `compile_and_save_blueprint`. No `execute_python` involved.
+
+**Example: scripting multiplayer PIE for net trace capture**
+
+> Start a trace, launch a 2-client listen-server PIE session for 5 seconds, stop, and analyze the net channel.
+
+The agent calls `start_trace`, `start_pie("listen_server", 2)`, waits, `stop_pie`, `stop_trace`, then `get_trace_net_summary` on the returned `.utrace` path — surfacing per-connection bandwidth, top replicated actors, and dominant RPCs/properties.
 
 ### Creating Niagara Particle Effects
 
@@ -411,6 +479,7 @@ Unreal Insights (deep dive, when CSV profiler flags a problem):
 | **Insights: analyze_trace** | Function name, source file/line, call count, total/avg/max inclusive time per scope |
 | **Insights: get_trace_spikes** | Frames exceeding budget with the top contributing scopes per frame |
 | **Insights: get_trace_frame_summary** | Frame count, avg/min/max frame time, FPS, p50/p90/p95/p99 percentiles |
+| **Insights: get_trace_net_summary** | Per-connection packet/byte totals (in/out + drop rate), top objects by outbound replication bandwidth, top event types (RPCs / replicated properties) by bandwidth. Requires a multiplayer trace — pair with `start_pie("listen_server", N)` for automated capture. |
 
 ### Tips for Best Results
 

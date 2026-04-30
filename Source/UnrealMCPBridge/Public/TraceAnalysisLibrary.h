@@ -66,4 +66,24 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MCP|TraceAnalysis")
 	static FString GetTraceFrameSummary(const FString& TracePath);
 
+	/**
+	 * Analyze the Net channel of a .utrace file. Returns network profiling data:
+	 * per-connection packet/byte totals (outbound and inbound), top objects by
+	 * bandwidth (which actors send the most data), and top event types by
+	 * bandwidth (which RPCs / replicated properties dominate).
+	 *
+	 * Useful for diagnosing replication bottlenecks: high-bandwidth actors are
+	 * candidates for relevancy filtering, NetUpdateFrequency tuning, or
+	 * push-model replication.
+	 *
+	 * Reports `has_net_data: false` if the trace has no Net channel events
+	 * (e.g., a single-player editor session that wasn't networked).
+	 *
+	 * @param TracePath Absolute path to the .utrace file
+	 * @param TopN Number of top objects/event types to return (default 20)
+	 * @return JSON string with net summary, or a string starting with "Error:" on failure
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MCP|TraceAnalysis")
+	static FString GetTraceNetSummary(const FString& TracePath, int32 TopN = 20);
+
 };

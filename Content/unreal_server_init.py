@@ -1445,7 +1445,7 @@ class MCPUnrealBridge:
     @staticmethod
     def start_trace(channels=None):
         """Start a trace capture to file. Returns the trace file path.
-        Channels default to CPU, GPU, Frame, Counters, Region, Bookmark."""
+        Channels default to CPU, GPU, Frame, Counters, Region, Bookmark, Net."""
         try:
             tul = unreal.TraceUtilLibrary
             if tul.is_tracing():
@@ -1455,15 +1455,27 @@ class MCPUnrealBridge:
                 channels = ['CpuChannel', 'GpuChannel', 'FrameChannel',
                             'CountersChannel', 'StatsChannel',
                             'RenderCommandsChannel', 'RegionChannel',
-                            'BookmarkChannel']
+                            'BookmarkChannel', 'NetChannel']
 
             import time
             filename = f'mcp_trace_{int(time.time())}'
             result = tul.start_trace_to_file(filename, channels)
-            if result:
-                return json.dumps({"status": "success", "result": f"Trace started: {filename}"})
-            else:
+            if not result:
                 return json.dumps({"status": "error", "message": "start_trace_to_file returned false"})
+
+            # The NetChannel records nothing unless the runtime verbosity is non-zero.
+            # Console-set NetTrace verbosity to 2 (full per-property detail) so any
+            # networked PIE session captured during this trace actually emits events.
+            try:
+                ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+                world = ues.get_editor_world() if ues else None
+                if world is not None:
+                    unreal.SystemLibrary.execute_console_command(world, "NetTrace.SetTraceVerbosity 2")
+            except Exception:
+                # Non-fatal — tracing still works for other channels even if NetTrace can't be enabled.
+                pass
+
+            return json.dumps({"status": "success", "result": f"Trace started: {filename}"})
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)})
 
@@ -1523,6 +1535,46 @@ class MCPUnrealBridge:
         try:
             trace_path = decode_b64_param(trace_path)
             result = unreal.TraceAnalysisLibrary.get_trace_frame_summary(str(trace_path))
+            if result.startswith("Error:"):
+                return json.dumps({"status": "error", "message": result})
+            return json.dumps({"status": "success", "result": result})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e)})
+
+    @staticmethod
+    def start_pie(net_mode="standalone", num_clients=1):
+        """Start a PIE session with the requested net mode and client count."""
+        try:
+            net_mode = decode_b64_param(net_mode)
+            ok = unreal.PIEControlLibrary.start_pie(str(net_mode), int(num_clients))
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def stop_pie():
+        """Stop the active PIE session."""
+        try:
+            ok = unreal.PIEControlLibrary.stop_pie()
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def is_pie_running():
+        """Check if PIE is currently running."""
+        try:
+            running = unreal.PIEControlLibrary.is_pie_running()
+            return json.dumps({"status": "success", "result": bool(running)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_trace_net_summary(trace_path, top_n=20):
+        """Analyze the Net channel of a .utrace file."""
+        try:
+            trace_path = decode_b64_param(trace_path)
+            result = unreal.TraceAnalysisLibrary.get_trace_net_summary(str(trace_path), int(top_n))
             if result.startswith("Error:"):
                 return json.dumps({"status": "error", "message": result})
             return json.dumps({"status": "success", "result": result})
@@ -1670,6 +1722,516 @@ class MCPUnrealBridge:
 
             return json.dumps({"status": "success", "result": json.dumps(result)})
 
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    # ========================================================================
+    # Blueprint Graph Introspection (BlueprintGraphLibrary wrappers)
+    # ========================================================================
+
+    @staticmethod
+    def _bp_load(blueprint_path):
+        """Load a Blueprint asset by path. Accepts b64-encoded paths.
+        Returns the UBlueprint or None if not found."""
+        path = decode_b64_param(blueprint_path)
+        bp = unreal.load_asset(str(path))
+        if bp is None:
+            return None
+        # Generated class paths get redirected; ensure we have a UBlueprint
+        if not isinstance(bp, unreal.Blueprint):
+            return None
+        return bp
+
+    @staticmethod
+    def get_node_title(blueprint_path, node_id):
+        """Get the human-readable title of a node."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            title = unreal.BlueprintGraphLibrary.get_node_title(bp, str(node_id))
+            return json.dumps({"status": "success", "result": title})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_function_reference(blueprint_path, node_id):
+        """Get MemberParent::MemberName for a K2Node_CallFunction."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            ref = unreal.BlueprintGraphLibrary.get_function_reference(bp, str(node_id))
+            return json.dumps({"status": "success", "result": ref})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_event_reference(blueprint_path, node_id):
+        """Get the event name for K2Node_Event / K2Node_CustomEvent."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            ref = unreal.BlueprintGraphLibrary.get_event_reference(bp, str(node_id))
+            return json.dumps({"status": "success", "result": ref})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_variable_reference(blueprint_path, node_id):
+        """Get the variable name for K2Node_VariableGet / VariableSet."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            ref = unreal.BlueprintGraphLibrary.get_variable_reference(bp, str(node_id))
+            return json.dumps({"status": "success", "result": ref})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_macro_reference(blueprint_path, node_id):
+        """Get the macro identifier for K2Node_MacroInstance."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            ref = unreal.BlueprintGraphLibrary.get_macro_reference(bp, str(node_id))
+            return json.dumps({"status": "success", "result": ref})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_pin_connections(blueprint_path, node_id, pin_name):
+        """Get pins linked to the given pin (format: OtherNodeId.OtherPinName)."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            pin_name = decode_b64_param(pin_name)
+            connections = unreal.BlueprintGraphLibrary.get_pin_connections(bp, str(node_id), str(pin_name))
+            return json.dumps({"status": "success", "result": list(connections)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_pin_default_value(blueprint_path, node_id, pin_name):
+        """Get the default literal value of an unconnected pin."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            pin_name = decode_b64_param(pin_name)
+            value = unreal.BlueprintGraphLibrary.get_pin_default_value(bp, str(node_id), str(pin_name))
+            return json.dumps({"status": "success", "result": value})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_function_graph_names(blueprint_path):
+        """List user-defined function graphs on a Blueprint."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            names = unreal.BlueprintGraphLibrary.get_function_graph_names(bp)
+            return json.dumps({"status": "success", "result": list(names)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_node_ids_in_graph(blueprint_path, graph_name):
+        """List node IDs in a specific named graph (event, function, or macro)."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            graph_name = decode_b64_param(graph_name)
+            ids = unreal.BlueprintGraphLibrary.get_node_ids_in_graph(bp, str(graph_name))
+            return json.dumps({"status": "success", "result": list(ids)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_component_template_names(blueprint_path):
+        """List components on a Blueprint's Simple Construction Script."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            names = unreal.BlueprintGraphLibrary.get_component_template_names(bp)
+            return json.dumps({"status": "success", "result": list(names)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_component_template_class(blueprint_path, component_name):
+        """Get the class name of a Blueprint SCS component."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            component_name = decode_b64_param(component_name)
+            cls = unreal.BlueprintGraphLibrary.get_component_template_class(bp, str(component_name))
+            return json.dumps({"status": "success", "result": cls})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    # ------------------------------------------------------------------------
+    # Read holdovers (existed in C++ but had no MCP wrapper)
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def get_node_ids(blueprint_path):
+        """List all node IDs in a Blueprint's event graph."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            ids = unreal.BlueprintGraphLibrary.get_node_ids(bp)
+            return json.dumps({"status": "success", "result": list(ids)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_pin_names(blueprint_path, node_id):
+        """List all pin names on a node."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            names = unreal.BlueprintGraphLibrary.get_pin_names(bp, str(node_id))
+            return json.dumps({"status": "success", "result": list(names)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_pin_details(blueprint_path, node_id):
+        """Get all pin details on a node (PinName|Direction|Type)."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            details = unreal.BlueprintGraphLibrary.get_pin_details(bp, str(node_id))
+            return json.dumps({"status": "success", "result": list(details)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    # ------------------------------------------------------------------------
+    # Blueprint Graph Write Functions
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def _load_class(class_path):
+        """Resolve a class path like '/Script/Engine.Actor' or '/Game/BP/BP_Foo.BP_Foo_C'.
+        Returns the UClass or None."""
+        path = str(decode_b64_param(class_path))
+        cls = unreal.load_class(None, path)
+        if cls is None:
+            # Fall back to load_object for engine classes that lack a _C suffix
+            cls = unreal.load_object(None, path)
+        return cls
+
+    @staticmethod
+    def create_new_blueprint(path, name, parent_class_path):
+        """Create a new Blueprint asset. Returns the BP path on success."""
+        try:
+            path = decode_b64_param(path)
+            name = decode_b64_param(name)
+            parent = MCPUnrealBridge._load_class(parent_class_path)
+            if parent is None:
+                return json.dumps({"status": "error", "message": f"Parent class not found: {parent_class_path}"})
+            bp = unreal.BlueprintGraphLibrary.create_new_blueprint(str(path), str(name), parent)
+            if bp is None:
+                return json.dumps({"status": "error", "message": "create_new_blueprint returned null"})
+            return json.dumps({"status": "success", "result": bp.get_path_name()})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_event_node(blueprint_path, event_name, pos_x=0, pos_y=0):
+        """Add an event node (BeginPlay, Tick, etc.). Returns the node ID."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            event_name = decode_b64_param(event_name)
+            nid = unreal.BlueprintGraphLibrary.add_event_node(bp, str(event_name), float(pos_x), float(pos_y))
+            return json.dumps({"status": "success", "result": nid})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_call_function_node(blueprint_path, target_class_path, function_name, pos_x=0, pos_y=0):
+        """Add a function call node. Returns the node ID."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            target = MCPUnrealBridge._load_class(target_class_path)
+            if target is None:
+                return json.dumps({"status": "error", "message": f"Target class not found: {target_class_path}"})
+            function_name = decode_b64_param(function_name)
+            nid = unreal.BlueprintGraphLibrary.add_call_function_node(
+                bp, target, str(function_name), float(pos_x), float(pos_y))
+            return json.dumps({"status": "success", "result": nid})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_variable_get_node(blueprint_path, variable_name, pos_x=0, pos_y=0):
+        """Add a variable Get node. Returns the node ID."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            variable_name = decode_b64_param(variable_name)
+            nid = unreal.BlueprintGraphLibrary.add_variable_get_node(
+                bp, str(variable_name), float(pos_x), float(pos_y))
+            return json.dumps({"status": "success", "result": nid})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_variable_set_node(blueprint_path, variable_name, pos_x=0, pos_y=0):
+        """Add a variable Set node. Returns the node ID."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            variable_name = decode_b64_param(variable_name)
+            nid = unreal.BlueprintGraphLibrary.add_variable_set_node(
+                bp, str(variable_name), float(pos_x), float(pos_y))
+            return json.dumps({"status": "success", "result": nid})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_branch_node(blueprint_path, pos_x=0, pos_y=0):
+        """Add a Branch (if/else) node. Returns the node ID."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            nid = unreal.BlueprintGraphLibrary.add_branch_node(bp, float(pos_x), float(pos_y))
+            return json.dumps({"status": "success", "result": nid})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_custom_event_node(blueprint_path, event_name, pos_x=0, pos_y=0):
+        """Add a Custom Event node. Returns the node ID."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            event_name = decode_b64_param(event_name)
+            nid = unreal.BlueprintGraphLibrary.add_custom_event_node(
+                bp, str(event_name), float(pos_x), float(pos_y))
+            return json.dumps({"status": "success", "result": nid})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_spawn_actor_node(blueprint_path, actor_class_path, pos_x=0, pos_y=0):
+        """Add a SpawnActor node (UK2Node_SpawnActorFromClass). Returns the node ID."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            actor_cls = MCPUnrealBridge._load_class(actor_class_path)
+            if actor_cls is None:
+                return json.dumps({"status": "error", "message": f"Actor class not found: {actor_class_path}"})
+            nid = unreal.BlueprintGraphLibrary.add_spawn_actor_node(
+                bp, actor_cls, float(pos_x), float(pos_y))
+            return json.dumps({"status": "success", "result": nid})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def connect_pins(blueprint_path, source_node_id, source_pin, target_node_id, target_pin):
+        """Connect two pins. Returns True on success."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            source_node_id = decode_b64_param(source_node_id)
+            source_pin = decode_b64_param(source_pin)
+            target_node_id = decode_b64_param(target_node_id)
+            target_pin = decode_b64_param(target_pin)
+            ok = unreal.BlueprintGraphLibrary.connect_pins(
+                bp, str(source_node_id), str(source_pin),
+                str(target_node_id), str(target_pin))
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def set_pin_default_value(blueprint_path, node_id, pin_name, value):
+        """Set the default value of a pin. Returns True on success."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            node_id = decode_b64_param(node_id)
+            pin_name = decode_b64_param(pin_name)
+            value = decode_b64_param(value)
+            ok = unreal.BlueprintGraphLibrary.set_pin_default_value(
+                bp, str(node_id), str(pin_name), str(value))
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_function_graph(blueprint_path, graph_name):
+        """Create a new user-defined function graph."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            graph_name = decode_b64_param(graph_name)
+            ok = unreal.BlueprintGraphLibrary.add_function_graph(bp, str(graph_name))
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_function_parameter(blueprint_path, function_graph_name, param_name, type_name,
+                               is_input=True, default_value=""):
+        """Add an input or output parameter to a function graph."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            function_graph_name = decode_b64_param(function_graph_name)
+            param_name = decode_b64_param(param_name)
+            type_name = decode_b64_param(type_name)
+            default_value = decode_b64_param(default_value)
+            # Be lenient: callers may quote numeric defaults to satisfy the str schema.
+            # Strip outer double-quotes so they don't get baked into the pin literal.
+            dv = str(default_value)
+            if len(dv) >= 2 and dv.startswith('"') and dv.endswith('"'):
+                dv = dv[1:-1]
+            ok = unreal.BlueprintGraphLibrary.add_function_parameter(
+                bp, str(function_graph_name), str(param_name), str(type_name),
+                bool(is_input), dv)
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def add_variable(blueprint_path, name, type_name, instance_editable=True):
+        """Add a member variable to a Blueprint. Returns True on success."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            name = decode_b64_param(name)
+            type_name = decode_b64_param(type_name)
+            ok = unreal.BlueprintGraphLibrary.add_variable(
+                bp, str(name), str(type_name), bool(instance_editable))
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def compile_and_save_blueprint(blueprint_path):
+        """Compile and save a Blueprint. Returns True on success."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            ok = unreal.BlueprintGraphLibrary.compile_and_save_blueprint(bp)
+            return json.dumps({"status": "success", "result": bool(ok)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    # ------------------------------------------------------------------------
+    # BP Function/Variable Metadata (TODO #14)
+    # ------------------------------------------------------------------------
+
+    @staticmethod
+    def get_macro_graph_names(blueprint_path):
+        """List macro graphs defined on a Blueprint."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            names = unreal.BlueprintGraphLibrary.get_macro_graph_names(bp)
+            return json.dumps({"status": "success", "result": list(names)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_member_variable_names(blueprint_path):
+        """List member variables declared on a Blueprint."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            names = unreal.BlueprintGraphLibrary.get_member_variable_names(bp)
+            return json.dumps({"status": "success", "result": list(names)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_member_variable_type(blueprint_path, variable_name):
+        """Get the type of a member variable as a richer string."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            variable_name = decode_b64_param(variable_name)
+            t = unreal.BlueprintGraphLibrary.get_member_variable_type(bp, str(variable_name))
+            return json.dumps({"status": "success", "result": t})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_function_metadata(blueprint_path, function_graph_name):
+        """Get function-graph metadata: Category|Access|Pure|Const."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            function_graph_name = decode_b64_param(function_graph_name)
+            md = unreal.BlueprintGraphLibrary.get_function_metadata(bp, str(function_graph_name))
+            return json.dumps({"status": "success", "result": md})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_function_parameters(blueprint_path, function_graph_name):
+        """Get a function graph's input/output parameters."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            function_graph_name = decode_b64_param(function_graph_name)
+            params = unreal.BlueprintGraphLibrary.get_function_parameters(bp, str(function_graph_name))
+            return json.dumps({"status": "success", "result": list(params)})
+        except Exception as e:
+            return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
+
+    @staticmethod
+    def get_overridable_functions(blueprint_path):
+        """Get parent BlueprintEvent functions not yet overridden."""
+        try:
+            bp = MCPUnrealBridge._bp_load(blueprint_path)
+            if bp is None:
+                return json.dumps({"status": "error", "message": f"Blueprint not found: {blueprint_path}"})
+            names = unreal.BlueprintGraphLibrary.get_overridable_functions(bp)
+            return json.dumps({"status": "success", "result": list(names)})
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e), "traceback": traceback.format_exc()})
 

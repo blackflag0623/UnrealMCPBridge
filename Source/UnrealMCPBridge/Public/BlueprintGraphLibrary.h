@@ -133,6 +133,23 @@ public:
 		float PosX = 0.f,
 		float PosY = 0.f);
 
+	/** Add a SpawnActor node (the canonical UK2Node_SpawnActorFromClass).
+	 * Creates the single-node form rather than the BeginDeferredActorSpawnFromClass +
+	 * FinishSpawningActor workaround. ReconstructNode is called so that any
+	 * ExposeOnSpawn properties on ActorClass appear as input pins.
+	 * @param Blueprint Target Blueprint
+	 * @param ActorClass The class to spawn (e.g., loaded BP class /Game/BP/BP_NPC.BP_NPC_C)
+	 * @param PosX Node X position in graph
+	 * @param PosY Node Y position in graph
+	 * @return Node ID string, or empty on failure
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Nodes")
+	static FString AddSpawnActorNode(
+		UBlueprint* Blueprint,
+		UClass* ActorClass,
+		float PosX = 0.f,
+		float PosY = 0.f);
+
 	// =========================================================================
 	// PIN OPERATIONS
 	// =========================================================================
@@ -170,6 +187,37 @@ public:
 	// =========================================================================
 	// VARIABLES
 	// =========================================================================
+
+	/** Add a new user-defined function graph to a Blueprint.
+	 * The graph is created with default FunctionEntry node and no parameters.
+	 * Use AddFunctionParameter to add inputs/outputs.
+	 * @param Blueprint Target Blueprint
+	 * @param GraphName Name of the new function graph
+	 * @return true if the function graph was created
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Functions")
+	static bool AddFunctionGraph(
+		UBlueprint* Blueprint,
+		const FString& GraphName);
+
+	/** Add a parameter (input or output) to an existing function graph.
+	 * If adding the first output parameter, a FunctionResult node is created automatically.
+	 * @param Blueprint Target Blueprint
+	 * @param FunctionGraphName Name of the function graph
+	 * @param ParamName Parameter name
+	 * @param TypeName Type: "bool", "int", "float", "string", "Vector", "Rotator", "Transform", or a class path
+	 * @param bIsInput If true, parameter is an input. If false, an output.
+	 * @param DefaultValue Default value literal for input parameters (empty = no default)
+	 * @return true if the parameter was added
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Functions")
+	static bool AddFunctionParameter(
+		UBlueprint* Blueprint,
+		const FString& FunctionGraphName,
+		const FString& ParamName,
+		const FString& TypeName,
+		bool bIsInput = true,
+		const FString& DefaultValue = TEXT(""));
 
 	/** Add a variable to a Blueprint.
 	 * @param Blueprint Target Blueprint
@@ -227,8 +275,180 @@ public:
 		UBlueprint* Blueprint,
 		const FString& NodeId);
 
+	/** Get the human-readable list-view title of a node.
+	 * @param Blueprint Target Blueprint
+	 * @param NodeId Node ID
+	 * @return Node title string (e.g., "Print String", "Event BeginPlay")
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetNodeTitle(
+		UBlueprint* Blueprint,
+		const FString& NodeId);
+
+	/** Get the function called by a K2Node_CallFunction node.
+	 * @param Blueprint Target Blueprint
+	 * @param NodeId Node ID
+	 * @return Format "MemberParent::MemberName", or empty string for non-call nodes
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetFunctionReference(
+		UBlueprint* Blueprint,
+		const FString& NodeId);
+
+	/** Get the event/function being implemented by a K2Node_Event or K2Node_CustomEvent.
+	 * @param Blueprint Target Blueprint
+	 * @param NodeId Node ID
+	 * @return Format "MemberParent::MemberName" for events, "CustomEventName" for custom events, empty otherwise
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetEventReference(
+		UBlueprint* Blueprint,
+		const FString& NodeId);
+
+	/** Get the variable name referenced by a K2Node_VariableGet or K2Node_VariableSet.
+	 * @param Blueprint Target Blueprint
+	 * @param NodeId Node ID
+	 * @return Variable name, or empty string for non-variable nodes
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetVariableReference(
+		UBlueprint* Blueprint,
+		const FString& NodeId);
+
+	/** Get the macro graph identifier referenced by a K2Node_MacroInstance.
+	 * @param Blueprint Target Blueprint
+	 * @param NodeId Node ID
+	 * @return Format "MacroLibrary::MacroName" (or just "MacroName" if no library), empty for non-macro nodes
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetMacroReference(
+		UBlueprint* Blueprint,
+		const FString& NodeId);
+
+	/** Get the pins this pin is connected to.
+	 * @param Blueprint Target Blueprint
+	 * @param NodeId Node ID
+	 * @param PinName Pin internal name
+	 * @return Array of "OtherNodeId.OtherPinName" strings (empty if pin is not connected)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetPinConnections(
+		UBlueprint* Blueprint,
+		const FString& NodeId,
+		const FString& PinName);
+
+	/** Get the default literal value of an unconnected input pin.
+	 * @param Blueprint Target Blueprint
+	 * @param NodeId Node ID
+	 * @param PinName Pin internal name
+	 * @return DefaultValue string for value pins, or DefaultObject path for object/class pins. Empty if no default.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetPinDefaultValue(
+		UBlueprint* Blueprint,
+		const FString& NodeId,
+		const FString& PinName);
+
+	/** Get the names of user-defined function graphs on a Blueprint.
+	 * @param Blueprint Target Blueprint
+	 * @return Array of function graph names (excludes event graphs and macros)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetFunctionGraphNames(UBlueprint* Blueprint);
+
+	/** Get all node IDs in a named graph (function graph, event graph, or macro graph).
+	 * @param Blueprint Target Blueprint
+	 * @param GraphName Name of the graph (e.g., "MyFunction", "EventGraph")
+	 * @return Array of node ID strings
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetNodeIdsInGraph(
+		UBlueprint* Blueprint,
+		const FString& GraphName);
+
+	/** Get the names of components on a Blueprint's Simple Construction Script (SCS).
+	 * @param Blueprint Target Blueprint
+	 * @return Array of component variable names
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetComponentTemplateNames(UBlueprint* Blueprint);
+
+	/** Get the class name of an SCS component template.
+	 * @param Blueprint Target Blueprint
+	 * @param ComponentName Component variable name
+	 * @return Class name (e.g., "StaticMeshComponent"), or empty if not found
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetComponentTemplateClass(
+		UBlueprint* Blueprint,
+		const FString& ComponentName);
+
+	/** Get the names of macro graphs defined on a Blueprint.
+	 * @param Blueprint Target Blueprint
+	 * @return Array of macro graph names
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetMacroGraphNames(UBlueprint* Blueprint);
+
+	/** Get the names of member variables declared on a Blueprint (NewVariables).
+	 * @param Blueprint Target Blueprint
+	 * @return Array of variable names
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetMemberVariableNames(UBlueprint* Blueprint);
+
+	/** Get the type of a member variable as a richer string.
+	 * Format: "category" for primitives, "struct:Name", "object:/Path", "class:/Path",
+	 * "enum:Name". Container variables get "TArray<...>" / "TSet<...>" / "TMap<K,V>" prefix.
+	 * @param Blueprint Target Blueprint
+	 * @param VariableName Variable name
+	 * @return Type string, or empty if not found
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetMemberVariableType(
+		UBlueprint* Blueprint,
+		const FString& VariableName);
+
+	/** Get function-graph metadata.
+	 * Format: "Category|Access|Pure|Const" where
+	 *   Access in {"Public","Protected","Private"},
+	 *   Pure in {"Pure","Impure"},
+	 *   Const in {"Const","NonConst"}.
+	 * @param Blueprint Target Blueprint
+	 * @param FunctionGraphName Name of the function graph
+	 * @return Metadata string, or empty if not found
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static FString GetFunctionMetadata(
+		UBlueprint* Blueprint,
+		const FString& FunctionGraphName);
+
+	/** Get a function graph's input and output parameters.
+	 * Each entry is "ParamName|Direction|Type|DefaultValue" where
+	 * Direction is "Input"/"Output". Default value is empty for outputs.
+	 * @param Blueprint Target Blueprint
+	 * @param FunctionGraphName Name of the function graph
+	 * @return Array of parameter strings
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetFunctionParameters(
+		UBlueprint* Blueprint,
+		const FString& FunctionGraphName);
+
+	/** Get the names of parent-class BlueprintEvent functions that are NOT yet
+	 * overridden in this Blueprint's event graph. Useful for discovering
+	 * which events the BP could implement (BeginPlay, Tick, etc. on Actor).
+	 * @param Blueprint Target Blueprint
+	 * @return Array of overridable function names
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Blueprint Graph|Introspection")
+	static TArray<FString> GetOverridableFunctions(UBlueprint* Blueprint);
+
 private:
 	static UEdGraph* GetEventGraph(UBlueprint* Blueprint);
+	static UEdGraph* FindGraphByName(UBlueprint* Blueprint, const FString& GraphName);
 	static UEdGraphNode* FindNodeById(UEdGraph* Graph, const FString& NodeId);
+	static UEdGraphNode* FindNodeByIdAcrossGraphs(UBlueprint* Blueprint, const FString& NodeId);
 	static bool TypeNameToPinType(const FString& TypeName, FEdGraphPinType& OutPinType);
+	static FString FormatPinType(const FEdGraphPinType& T);
 };

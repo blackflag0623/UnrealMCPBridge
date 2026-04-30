@@ -499,8 +499,14 @@ Please create a town in the current Unreal Engine project.
 def start_trace() -> str:
     """
     Start capturing an Unreal Insights trace to file.
-    Captures CPU, GPU, Frame, Counters, and Region channels.
+    Captures CPU, GPU, Frame, Counters, Region, and Net channels.
+    The Net channel records replication bandwidth, RPC volume, and packet timing —
+    use it for networked-game profiling (relevancy, NetUpdateFrequency, replication conditions).
     Call stop_trace() when done to get the file path.
+
+    UE 5.5 limitation: do NOT run while a CSV profile is active — they trip an
+    engine assertion (CsvProfilerProvider.cpp:170, 'CurrentCapture'). Use them
+    sequentially on UE 5.5. Concurrent capture works fine on UE 5.6 and 5.7.
     """
     result = send_command("start_trace")
     if result.get("status") == "success":
@@ -579,6 +585,71 @@ def get_trace_frame_summary(trace_path: str) -> str:
         return result.get("result", "{}")
     return f"Error: {result.get('message', 'Unknown error')}"
 
+@mcp.tool()
+def start_pie(net_mode: str = "standalone", num_clients: int = 1) -> str:
+    """
+    Start a Play-In-Editor (PIE) session with optional multiplayer config.
+
+    Args:
+        net_mode: "standalone" (default), "listen_server", or "client"
+        num_clients: Number of player windows to spawn (>= 1)
+
+    Returns "True" if PIE start was requested successfully. PIE start is async —
+    use is_pie_running() to confirm before issuing further commands.
+
+    Example: start_pie("listen_server", 2) to launch a listen-server with 2 clients
+    (matching the multiplayer dropdown in the UE Play toolbar).
+    """
+    result = send_command("start_pie", {"net_mode": net_mode, "num_clients": num_clients})
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def stop_pie() -> str:
+    """Stop the active PIE session. Returns 'True' if stop was requested."""
+    result = send_command("stop_pie")
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def is_pie_running() -> str:
+    """Check whether a PIE session is currently running. Returns 'True' or 'False'."""
+    result = send_command("is_pie_running")
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_trace_net_summary(trace_path: str, top_n: int = 20) -> str:
+    """
+    Analyze the Net channel of a .utrace file. Returns network profiling data
+    parsed from net trace events captured during the session:
+
+    - Per-connection packet/byte totals (outbound + inbound) and drop rate
+    - Top objects by outbound bandwidth (which actors are sending the most data)
+    - Top event types by outbound bandwidth (which RPCs / replicated properties dominate)
+    - Game instance info (server vs client, Iris replication on/off)
+
+    Use this to diagnose replication bottlenecks: high-bandwidth actors are candidates
+    for relevancy filtering, NetUpdateFrequency tuning, or push-model replication.
+
+    If the trace has no Net channel data (single-player editor session), returns
+    {has_net_data: false, ...} cleanly with a note.
+
+    Args:
+        trace_path: Absolute path to the .utrace file
+        top_n: Top N objects and event types to return (default 20, 0 = all)
+    """
+    result = send_command("get_trace_net_summary", {
+        "trace_path": trace_path,
+        "top_n": top_n,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "{}")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
 # ============================================================================
 # CSV Profiler Tools
 # ============================================================================
@@ -590,6 +661,10 @@ def start_csv_profile() -> str:
     Captures per-frame aggregate stats: FrameTime, GameThreadTime, RenderThreadTime,
     GPUTime, DrawCalls, memory usage, and hundreds of category-level counters.
     Call stop_csv_profile() when done to get the parsed summary.
+
+    UE 5.5 limitation: do NOT run while an Insights trace (start_trace) is active —
+    they trip an engine assertion (CsvProfilerProvider.cpp:170, 'CurrentCapture').
+    Use them sequentially on UE 5.5. Concurrent capture works fine on UE 5.6 and 5.7.
     """
     result = send_command("start_csv_profile")
     if result.get("status") == "success":
@@ -625,6 +700,590 @@ def get_csv_profile() -> str:
     result = send_command("get_csv_profile")
     if result.get("status") == "success":
         return result.get("result", "{}")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+# ============================================================================
+# Blueprint Graph Introspection Tools
+# ============================================================================
+# These wrap UBlueprintGraphLibrary read functions for walking BP graphs.
+# blueprint_path is an asset path like "/Game/Blueprints/BP_NPC.BP_NPC".
+# node_id is a string like "K2Node_CallFunction_27" returned by node lookup.
+
+@mcp.tool()
+def get_node_title(blueprint_path: str, node_id: str) -> str:
+    """
+    Get the human-readable list-view title of a Blueprint node.
+    Examples: "Print String", "Event BeginPlay", "Branch", "Get MyVar".
+
+    Use after listing node IDs to identify what each node is.
+    """
+    result = send_command("get_node_title", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_function_reference(blueprint_path: str, node_id: str) -> str:
+    """
+    For a K2Node_CallFunction node, return "MemberParent::MemberName".
+    Returns empty string for non-call nodes.
+
+    Use to determine which function a call node invokes.
+    """
+    result = send_command("get_function_reference", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_event_reference(blueprint_path: str, node_id: str) -> str:
+    """
+    For a K2Node_Event, return "MemberParent::MemberName" of the implemented function.
+    For a K2Node_CustomEvent, return the custom event name.
+    Returns empty string for other node types.
+    """
+    result = send_command("get_event_reference", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_variable_reference(blueprint_path: str, node_id: str) -> str:
+    """
+    For a K2Node_VariableGet or K2Node_VariableSet, return the variable name.
+    Returns empty string for non-variable nodes.
+    """
+    result = send_command("get_variable_reference", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_macro_reference(blueprint_path: str, node_id: str) -> str:
+    """
+    For a K2Node_MacroInstance, return "MacroLibrary::MacroName".
+    Returns empty string for non-macro nodes.
+    """
+    result = send_command("get_macro_reference", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_pin_connections(blueprint_path: str, node_id: str, pin_name: str) -> str:
+    """
+    Get the pins this pin is connected to.
+    Returns JSON list of "OtherNodeId.OtherPinName" strings.
+
+    This is the key function for walking a Blueprint graph - follow exec
+    pins ("then", "execute") to trace control flow, or follow data pins
+    to trace value flow between nodes.
+    """
+    result = send_command("get_pin_connections", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+        "pin_name": pin_name,
+    })
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_pin_default_value(blueprint_path: str, node_id: str, pin_name: str) -> str:
+    """
+    Get the default literal value of an unconnected input pin.
+    For object/class pins returns the asset path; for value pins
+    returns the literal string. Empty if no default is set.
+    """
+    result = send_command("get_pin_default_value", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+        "pin_name": pin_name,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_function_graph_names(blueprint_path: str) -> str:
+    """
+    List user-defined function graphs on a Blueprint (excludes event graphs and macros).
+    Returns JSON list of function graph names. Use the names with
+    get_node_ids_in_graph() to inspect a specific function.
+    """
+    result = send_command("get_function_graph_names", {
+        "blueprint_path": blueprint_path,
+    })
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_node_ids_in_graph(blueprint_path: str, graph_name: str) -> str:
+    """
+    List node IDs in a specific graph (event graph, function, or macro).
+    Returns JSON list. Pair with get_function_graph_names() to walk
+    user-defined functions, or pass "EventGraph" for the main event graph.
+    """
+    result = send_command("get_node_ids_in_graph", {
+        "blueprint_path": blueprint_path,
+        "graph_name": graph_name,
+    })
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_component_template_names(blueprint_path: str) -> str:
+    """
+    List components on a Blueprint's Simple Construction Script (SCS).
+    Returns JSON list of component variable names.
+    """
+    result = send_command("get_component_template_names", {
+        "blueprint_path": blueprint_path,
+    })
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_component_template_class(blueprint_path: str, component_name: str) -> str:
+    """
+    Get the class name of an SCS component on a Blueprint.
+    Example: "StaticMeshComponent", "PointLightComponent".
+    """
+    result = send_command("get_component_template_class", {
+        "blueprint_path": blueprint_path,
+        "component_name": component_name,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+# ----------------------------------------------------------------------------
+# Blueprint Graph Read Holdovers
+# ----------------------------------------------------------------------------
+
+@mcp.tool()
+def get_node_ids(blueprint_path: str) -> str:
+    """
+    List all node IDs in a Blueprint's event graph.
+    Returns JSON list. For non-event graphs (functions, macros), use
+    get_node_ids_in_graph() with the graph name instead.
+    """
+    result = send_command("get_node_ids", {"blueprint_path": blueprint_path})
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_pin_names(blueprint_path: str, node_id: str) -> str:
+    """
+    List all pin names on a node. Returns JSON list of internal pin names
+    (e.g., "execute", "then", "ReturnValue"). Pair with get_pin_details()
+    for direction and type info.
+    """
+    result = send_command("get_pin_names", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+    })
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_pin_details(blueprint_path: str, node_id: str) -> str:
+    """
+    Get detailed pin info for a node.
+    Returns JSON list of strings in format "PinName|Direction|Type"
+    where Direction is "Input" or "Output" and Type is the pin category
+    (exec, bool, int, float, struct, object, etc.).
+    """
+    result = send_command("get_pin_details", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id,
+    })
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+# ----------------------------------------------------------------------------
+# Blueprint Graph Write Tools
+# ----------------------------------------------------------------------------
+
+@mcp.tool()
+def create_new_blueprint(path: str, name: str, parent_class_path: str) -> str:
+    """
+    Create a new Blueprint asset.
+
+    Args:
+        path: Content path (e.g., "/Game/Blueprints")
+        name: Blueprint name (e.g., "BP_MyActor")
+        parent_class_path: Class path (e.g., "/Script/Engine.Actor", "/Script/Engine.Pawn")
+
+    Returns the full asset path of the created Blueprint, e.g.,
+    "/Game/Blueprints/BP_MyActor.BP_MyActor". Use this path with the
+    other BP graph tools and call compile_and_save_blueprint() when done.
+    """
+    result = send_command("create_new_blueprint", {
+        "path": path, "name": name, "parent_class_path": parent_class_path,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_event_node(blueprint_path: str, event_name: str, pos_x: float = 0, pos_y: float = 0) -> str:
+    """
+    Add an event node to a Blueprint's event graph (e.g., "ReceiveBeginPlay",
+    "ReceiveTick"). Note that BeginPlay and Tick already exist on new BPs;
+    use get_node_ids() + get_event_reference() to find them rather than adding duplicates.
+
+    Returns the node ID string. IDs may shift on compile, so re-introspect rather than caching.
+    """
+    result = send_command("add_event_node", {
+        "blueprint_path": blueprint_path,
+        "event_name": event_name,
+        "pos_x": pos_x, "pos_y": pos_y,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_call_function_node(blueprint_path: str, target_class_path: str, function_name: str,
+                           pos_x: float = 0, pos_y: float = 0) -> str:
+    """
+    Add a function call node.
+
+    Args:
+        target_class_path: Class that owns the function
+            (e.g., "/Script/Engine.KismetSystemLibrary", "/Script/Engine.KismetMathLibrary")
+        function_name: Internal function name (e.g., "PrintString", "K2_SetTimer")
+
+    Returns the node ID string.
+    """
+    result = send_command("add_call_function_node", {
+        "blueprint_path": blueprint_path,
+        "target_class_path": target_class_path,
+        "function_name": function_name,
+        "pos_x": pos_x, "pos_y": pos_y,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_variable_get_node(blueprint_path: str, variable_name: str,
+                          pos_x: float = 0, pos_y: float = 0) -> str:
+    """
+    Add a variable Get node. Variable must already exist on the Blueprint
+    (via add_variable()). Returns the node ID.
+    """
+    result = send_command("add_variable_get_node", {
+        "blueprint_path": blueprint_path,
+        "variable_name": variable_name,
+        "pos_x": pos_x, "pos_y": pos_y,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_variable_set_node(blueprint_path: str, variable_name: str,
+                          pos_x: float = 0, pos_y: float = 0) -> str:
+    """
+    Add a variable Set node. Variable must already exist on the Blueprint.
+    Returns the node ID.
+    """
+    result = send_command("add_variable_set_node", {
+        "blueprint_path": blueprint_path,
+        "variable_name": variable_name,
+        "pos_x": pos_x, "pos_y": pos_y,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_branch_node(blueprint_path: str, pos_x: float = 0, pos_y: float = 0) -> str:
+    """
+    Add a Branch (if/else) node. Returns the node ID.
+    Wire the bool input to the "Condition" pin and the exec outputs from "True"/"False".
+    """
+    result = send_command("add_branch_node", {
+        "blueprint_path": blueprint_path,
+        "pos_x": pos_x, "pos_y": pos_y,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_custom_event_node(blueprint_path: str, event_name: str,
+                          pos_x: float = 0, pos_y: float = 0) -> str:
+    """
+    Add a Custom Event node. Custom events are entry points callable from BP code.
+    Returns the node ID.
+    """
+    result = send_command("add_custom_event_node", {
+        "blueprint_path": blueprint_path,
+        "event_name": event_name,
+        "pos_x": pos_x, "pos_y": pos_y,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_spawn_actor_node(blueprint_path: str, actor_class_path: str,
+                         pos_x: float = 0, pos_y: float = 0) -> str:
+    """
+    Add a SpawnActor node (the canonical UK2Node_SpawnActorFromClass).
+    This is the preferred way to spawn actors in Blueprints — produces a single
+    node with class-specific ExposeOnSpawn property pins, instead of the
+    BeginDeferredActorSpawnFromClass + FinishSpawningActor two-node workaround.
+
+    Args:
+        actor_class_path: Class path of the actor to spawn
+            (e.g., "/Game/BP/BP_NPC.BP_NPC_C", "/Script/Engine.PointLight")
+
+    Returns the node ID. The node will have pins:
+    - execute / then (exec)
+    - Class (input class — already pinned to actor_class_path)
+    - SpawnTransform (input struct)
+    - CollisionHandlingOverride (input enum)
+    - Owner (input object)
+    - ReturnValue (output object — the spawned actor)
+    - Plus dynamic input pins for any properties on actor_class_path marked
+      EditAnywhere + ExposeOnSpawn (e.g., custom BP variables).
+    """
+    result = send_command("add_spawn_actor_node", {
+        "blueprint_path": blueprint_path,
+        "actor_class_path": actor_class_path,
+        "pos_x": pos_x, "pos_y": pos_y,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def connect_pins(blueprint_path: str, source_node_id: str, source_pin: str,
+                 target_node_id: str, target_pin: str) -> str:
+    """
+    Connect two pins between nodes (exec or data).
+
+    Pin name examples: "then" (event/call output exec), "execute" (call input exec),
+    "ReturnValue" (call output data). Use get_pin_names()/get_pin_details() to find
+    real names, since they're internal (not display) names.
+
+    Returns "True" or "False".
+    """
+    result = send_command("connect_pins", {
+        "blueprint_path": blueprint_path,
+        "source_node_id": source_node_id,
+        "source_pin": source_pin,
+        "target_node_id": target_node_id,
+        "target_pin": target_pin,
+    })
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def set_pin_default_value(blueprint_path: str, node_id: str, pin_name: str, value: str) -> str:
+    """
+    Set the default value of an unconnected input pin.
+    For object/class pins, pass the asset path (e.g., "/Game/BP/BP_NPC.BP_NPC_C").
+    For value pins, pass the literal string ("true", "5", "1.5", "Hello", etc.).
+    Returns "True" or "False".
+    """
+    result = send_command("set_pin_default_value", {
+        "blueprint_path": blueprint_path,
+        "node_id": node_id, "pin_name": pin_name, "value": value,
+    })
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_function_graph(blueprint_path: str, graph_name: str) -> str:
+    """
+    Create a new user-defined function graph on a Blueprint.
+    The function starts with an empty FunctionEntry node and no parameters.
+    Use add_function_parameter() to add inputs/outputs.
+    Returns "True" or "False".
+    """
+    result = send_command("add_function_graph", {
+        "blueprint_path": blueprint_path,
+        "graph_name": graph_name,
+    })
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_function_parameter(blueprint_path: str, function_graph_name: str, param_name: str,
+                           type_name: str, is_input: bool = True, default_value: str = "") -> str:
+    """
+    Add an input or output parameter to a function graph.
+    If adding the first output parameter, a FunctionResult node is created automatically.
+
+    Args:
+        type_name: "bool", "int", "float", "string", "name", "text",
+                   "Vector", "Rotator", "Transform", or a class path like "/Script/Engine.Actor"
+        is_input: True for input parameter, False for output.
+        default_value: Default value literal for input parameters (ignored for outputs).
+
+    Returns "True" or "False".
+    """
+    result = send_command("add_function_parameter", {
+        "blueprint_path": blueprint_path,
+        "function_graph_name": function_graph_name,
+        "param_name": param_name,
+        "type_name": type_name,
+        "is_input": is_input,
+        "default_value": default_value,
+    })
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def add_variable(blueprint_path: str, name: str, type_name: str, instance_editable: bool = True) -> str:
+    """
+    Add a member variable to a Blueprint.
+
+    Args:
+        type_name: "bool", "int", "float", "string", "name", "text",
+                   "Vector", "Rotator", "Transform", or a class path
+                   like "/Script/Engine.Actor"
+        instance_editable: If true, variable is editable per-instance in the editor.
+
+    Returns "True" or "False".
+    """
+    result = send_command("add_variable", {
+        "blueprint_path": blueprint_path,
+        "name": name, "type_name": type_name,
+        "instance_editable": instance_editable,
+    })
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def compile_and_save_blueprint(blueprint_path: str) -> str:
+    """
+    Compile and save a Blueprint. Call this after a series of add/connect
+    operations to persist the Blueprint to disk and mark it ready to use.
+    Returns "True" if compilation succeeded without errors.
+    """
+    result = send_command("compile_and_save_blueprint", {
+        "blueprint_path": blueprint_path,
+    })
+    if result.get("status") == "success":
+        return str(result.get("result", False))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+# ----------------------------------------------------------------------------
+# Blueprint Function/Variable Metadata (TODO #14)
+# ----------------------------------------------------------------------------
+
+@mcp.tool()
+def get_macro_graph_names(blueprint_path: str) -> str:
+    """
+    List macro graphs defined on a Blueprint.
+    Returns JSON list. Use the names with get_node_ids_in_graph() to walk a macro.
+    """
+    result = send_command("get_macro_graph_names", {"blueprint_path": blueprint_path})
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_member_variable_names(blueprint_path: str) -> str:
+    """
+    List member variables declared on a Blueprint (NewVariables, distinct from
+    components and from variables referenced by Get/Set nodes).
+    Returns JSON list of variable names.
+    """
+    result = send_command("get_member_variable_names", {"blueprint_path": blueprint_path})
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_member_variable_type(blueprint_path: str, variable_name: str) -> str:
+    """
+    Get the type of a member variable as a richer string.
+    Format: "category" for primitives, "struct:Name", "object:/Path", "class:/Path",
+    "enum:Name". Container types get "TArray<...>", "TSet<...>", or "TMap<K,V>" prefix.
+    """
+    result = send_command("get_member_variable_type", {
+        "blueprint_path": blueprint_path,
+        "variable_name": variable_name,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_function_metadata(blueprint_path: str, function_graph_name: str) -> str:
+    """
+    Get function-graph metadata.
+    Returns "Category|Access|Pure|Const" where
+    Access in {Public, Protected, Private}, Pure in {Pure, Impure},
+    Const in {Const, NonConst}.
+    """
+    result = send_command("get_function_metadata", {
+        "blueprint_path": blueprint_path,
+        "function_graph_name": function_graph_name,
+    })
+    if result.get("status") == "success":
+        return result.get("result", "")
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_function_parameters(blueprint_path: str, function_graph_name: str) -> str:
+    """
+    Get a function graph's input and output parameters.
+    Returns JSON list of "ParamName|Direction|Type|DefaultValue" strings.
+    Direction is "Input" or "Output". DefaultValue is empty for outputs.
+    """
+    result = send_command("get_function_parameters", {
+        "blueprint_path": blueprint_path,
+        "function_graph_name": function_graph_name,
+    })
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
+    return f"Error: {result.get('message', 'Unknown error')}"
+
+@mcp.tool()
+def get_overridable_functions(blueprint_path: str) -> str:
+    """
+    List parent-class BlueprintEvent functions that are NOT yet overridden in this BP.
+    Useful for discovering which events the BP could implement (e.g., on an Actor:
+    ReceiveBeginPlay, ReceiveTick, ReceiveActorBeginOverlap, etc.).
+    Returns JSON list of function names.
+    """
+    result = send_command("get_overridable_functions", {"blueprint_path": blueprint_path})
+    if result.get("status") == "success":
+        return json.dumps(result.get("result", []))
     return f"Error: {result.get('message', 'Unknown error')}"
 
 # Run the server

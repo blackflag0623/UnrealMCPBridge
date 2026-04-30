@@ -15,6 +15,7 @@
 #include "TraceServices/Model/TimingProfiler.h"
 #include "TraceServices/Model/Threads.h"
 #include "TraceServices/Model/Frames.h"
+#include "TraceServices/Model/NetProfiler.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -513,6 +514,244 @@ FString UTraceAnalysisLibrary::GetTraceFrameSummary(const FString& TracePath)
 	Root->SetNumberField(TEXT("duration_seconds"), Session->GetDurationSeconds());
 	Root->SetObjectField(TEXT("game_thread"), BuildFrameStats(ETraceFrameType::TraceFrameType_Game));
 	Root->SetObjectField(TEXT("render_thread"), BuildFrameStats(ETraceFrameType::TraceFrameType_Rendering));
+
+	FString OutputString;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+	FJsonSerializer::Serialize(Root, Writer);
+	return OutputString;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+FString UTraceAnalysisLibrary::GetTraceNetSummary(const FString& TracePath, int32 TopN)
+{
+	using namespace TraceServices;
+
+	FString Error;
+	TSharedPtr<const IAnalysisSession> Session = RunAnalysis(TracePath, Error);
+	if (!Session.IsValid())
+	{
+		return FString::Printf(TEXT("Error: %s"), *Error);
+	}
+
+	FAnalysisSessionReadScope ReadScope(*Session);
+
+	const INetProfilerProvider* NetProvider = ReadNetProfilerProvider(*Session);
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("trace_file"), TracePath);
+
+	if (!NetProvider || NetProvider->GetNetTraceVersion() == 0)
+	{
+		Root->SetBoolField(TEXT("has_net_data"), false);
+		Root->SetStringField(TEXT("note"),
+			TEXT("No Net channel data in this trace. The session was not networked, "
+			     "or the Net channel was not enabled. Capture a trace during a multiplayer "
+			     "PIE session to get network metrics."));
+		FString OutputString;
+		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+		FJsonSerializer::Serialize(Root, Writer);
+		return OutputString;
+	}
+
+	Root->SetBoolField(TEXT("has_net_data"), true);
+	Root->SetNumberField(TEXT("net_trace_version"), NetProvider->GetNetTraceVersion());
+
+	// Build a name-index → string lookup. Accessed by NameIndex for objects and event types.
+	TMap<uint32, FString> NameByIndex;
+	NetProvider->ReadNames([&NameByIndex](const FNetProfilerName* Names, uint64 Count)
+	{
+		for (uint64 i = 0; i < Count; ++i)
+		{
+			NameByIndex.Add(Names[i].NameIndex, FString(Names[i].Name ? Names[i].Name : TEXT("?")));
+		}
+	});
+
+	auto LookupName = [&NameByIndex](uint32 NameIndex) -> FString
+	{
+		if (const FString* Found = NameByIndex.Find(NameIndex))
+		{
+			return *Found;
+		}
+		return FString::Printf(TEXT("name#%u"), NameIndex);
+	};
+
+	// Build event-type-index → name lookup
+	TMap<uint32, FString> EventTypeNameByIndex;
+	NetProvider->ReadEventTypes([&](const FNetProfilerEventType* Types, uint64 Count)
+	{
+		for (uint64 i = 0; i < Count; ++i)
+		{
+			FString Name = Types[i].Name ? FString(Types[i].Name) : LookupName(Types[i].NameIndex);
+			EventTypeNameByIndex.Add(Types[i].EventTypeIndex, MoveTemp(Name));
+		}
+	});
+
+	auto LookupEventTypeName = [&EventTypeNameByIndex](uint32 EventTypeIndex) -> FString
+	{
+		if (const FString* Found = EventTypeNameByIndex.Find(EventTypeIndex))
+		{
+			return *Found;
+		}
+		return FString::Printf(TEXT("evtype#%u"), EventTypeIndex);
+	};
+
+	// Per-object and per-event-type accumulators (outbound only — that's the typical bottleneck)
+	struct FObjectAcc { uint64 Bits = 0; uint32 Events = 0; FString Name; };
+	struct FEventAcc  { uint64 Bits = 0; uint32 Count  = 0; FString Name; };
+	TMap<uint32, FObjectAcc> ObjectAccByIndex;   // ObjectInstanceIndex → totals
+	TMap<uint32, FEventAcc>  EventAccByIndex;    // EventTypeIndex → totals
+
+	TArray<TSharedPtr<FJsonValue>> GameInstancesJson;
+
+	const uint32 GameInstanceCount = NetProvider->GetGameInstanceCount();
+	NetProvider->ReadGameInstances([&](const FNetProfilerGameInstance& Instance)
+	{
+		TSharedRef<FJsonObject> InstanceJson = MakeShared<FJsonObject>();
+		InstanceJson->SetStringField(TEXT("name"), Instance.InstanceName ? Instance.InstanceName : TEXT(""));
+		InstanceJson->SetNumberField(TEXT("game_instance_id"), Instance.GameInstanceId);
+		InstanceJson->SetBoolField(TEXT("is_server"), Instance.bIsServer);
+		InstanceJson->SetBoolField(TEXT("uses_iris"), Instance.bIsUsingIrisReplication);
+
+		// Index objects by NetObjectId/Name on this game instance for the per-object accumulator
+		TMap<uint32, FNetProfilerObjectInstance> ObjectByIndex;
+		NetProvider->ReadObjects(Instance.GameInstanceIndex, [&](const FNetProfilerObjectInstance& Obj)
+		{
+			ObjectByIndex.Add(Obj.ObjectIndex, Obj);
+		});
+
+		// For each connection, walk packets in both directions
+		TArray<TSharedPtr<FJsonValue>> ConnectionsJson;
+		NetProvider->ReadConnections(Instance.GameInstanceIndex, [&](const FNetProfilerConnection& Conn)
+		{
+			TSharedRef<FJsonObject> ConnJson = MakeShared<FJsonObject>();
+			ConnJson->SetStringField(TEXT("name"), Conn.Name ? Conn.Name : TEXT(""));
+			ConnJson->SetStringField(TEXT("address"), Conn.AddressString ? Conn.AddressString : TEXT(""));
+			ConnJson->SetNumberField(TEXT("connection_id"), Conn.ConnectionId);
+
+			auto WalkMode = [&](ENetProfilerConnectionMode Mode, const TCHAR* ModeName)
+			{
+				const uint32 PacketCount = NetProvider->GetPacketCount(Conn.ConnectionIndex, Mode);
+				uint64 TotalBytes = 0;
+				uint64 ContentBits = 0;
+				uint32 Delivered = 0;
+				uint32 Dropped = 0;
+
+				if (PacketCount > 0)
+				{
+					NetProvider->EnumeratePackets(Conn.ConnectionIndex, Mode, 0, PacketCount - 1,
+						[&](const FNetProfilerPacket& P)
+					{
+						TotalBytes += P.TotalPacketSizeInBytes;
+						ContentBits += P.ContentSizeInBits;
+						switch (P.DeliveryStatus)
+						{
+							case ENetProfilerDeliveryStatus::Delivered: ++Delivered; break;
+							case ENetProfilerDeliveryStatus::Dropped:   ++Dropped; break;
+							default: break;
+						}
+
+						// Walk content events and accumulate per-object and per-event-type bytes (outgoing only).
+						if (Mode == ENetProfilerConnectionMode::Outgoing && P.EventCount > 0)
+						{
+							const uint32 StartIdx = P.StartEventIndex;
+							const uint32 EndIdx = P.StartEventIndex + P.EventCount - 1;
+							NetProvider->EnumeratePacketContentEventsByIndex(Conn.ConnectionIndex, Mode,
+								StartIdx, EndIdx, [&](const FNetProfilerContentEvent& Ev)
+							{
+								const uint64 BitSize = (Ev.EndPos > Ev.StartPos) ? (Ev.EndPos - Ev.StartPos) : 0;
+
+								// Object accumulator (skip the zero "no object" sentinel)
+								if (Ev.ObjectInstanceIndex != 0)
+								{
+									FObjectAcc& Acc = ObjectAccByIndex.FindOrAdd(Ev.ObjectInstanceIndex);
+									Acc.Bits += BitSize;
+									Acc.Events += 1;
+									if (Acc.Name.IsEmpty())
+									{
+										if (const FNetProfilerObjectInstance* Obj = ObjectByIndex.Find(Ev.ObjectInstanceIndex))
+										{
+											Acc.Name = LookupName(Obj->NameIndex);
+										}
+										else
+										{
+											Acc.Name = FString::Printf(TEXT("obj#%u"), Ev.ObjectInstanceIndex);
+										}
+									}
+								}
+
+								// Event-type accumulator
+								FEventAcc& Acc = EventAccByIndex.FindOrAdd(Ev.EventTypeIndex);
+								Acc.Bits += BitSize;
+								Acc.Count += 1;
+								if (Acc.Name.IsEmpty())
+								{
+									Acc.Name = LookupEventTypeName(Ev.EventTypeIndex);
+								}
+							});
+						}
+					});
+				}
+
+				TSharedRef<FJsonObject> ModeJson = MakeShared<FJsonObject>();
+				ModeJson->SetNumberField(TEXT("packets"), PacketCount);
+				ModeJson->SetNumberField(TEXT("bytes_total"), static_cast<double>(TotalBytes));
+				ModeJson->SetNumberField(TEXT("content_bits"), static_cast<double>(ContentBits));
+				ModeJson->SetNumberField(TEXT("delivered"), Delivered);
+				ModeJson->SetNumberField(TEXT("dropped"), Dropped);
+				if (Delivered + Dropped > 0)
+				{
+					ModeJson->SetNumberField(TEXT("drop_rate_pct"),
+						100.0 * static_cast<double>(Dropped) / static_cast<double>(Delivered + Dropped));
+				}
+				ConnJson->SetObjectField(ModeName, ModeJson);
+			};
+
+			WalkMode(ENetProfilerConnectionMode::Outgoing, TEXT("outgoing"));
+			WalkMode(ENetProfilerConnectionMode::Incoming, TEXT("incoming"));
+
+			ConnectionsJson.Add(MakeShared<FJsonValueObject>(ConnJson));
+		});
+
+		InstanceJson->SetArrayField(TEXT("connections"), ConnectionsJson);
+		GameInstancesJson.Add(MakeShared<FJsonValueObject>(InstanceJson));
+	});
+
+	Root->SetNumberField(TEXT("game_instance_count"), GameInstanceCount);
+	Root->SetArrayField(TEXT("game_instances"), GameInstancesJson);
+
+	// Top objects by outbound bandwidth
+	TArray<FObjectAcc> TopObjects;
+	for (auto& Pair : ObjectAccByIndex) TopObjects.Add(Pair.Value);
+	TopObjects.Sort([](const FObjectAcc& A, const FObjectAcc& B) { return A.Bits > B.Bits; });
+
+	const int32 ObjLimit = (TopN > 0) ? FMath::Min(TopN, TopObjects.Num()) : TopObjects.Num();
+	TArray<TSharedPtr<FJsonValue>> TopObjectsJson;
+	for (int32 i = 0; i < ObjLimit; ++i)
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("name"), TopObjects[i].Name);
+		O->SetNumberField(TEXT("outbound_bytes"), static_cast<double>(TopObjects[i].Bits) / 8.0);
+		O->SetNumberField(TEXT("outbound_events"), TopObjects[i].Events);
+		TopObjectsJson.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("top_objects_by_outbound_bandwidth"), TopObjectsJson);
+
+	// Top event types by outbound bandwidth
+	TArray<FEventAcc> TopEvents;
+	for (auto& Pair : EventAccByIndex) TopEvents.Add(Pair.Value);
+	TopEvents.Sort([](const FEventAcc& A, const FEventAcc& B) { return A.Bits > B.Bits; });
+
+	const int32 EvtLimit = (TopN > 0) ? FMath::Min(TopN, TopEvents.Num()) : TopEvents.Num();
+	TArray<TSharedPtr<FJsonValue>> TopEventsJson;
+	for (int32 i = 0; i < EvtLimit; ++i)
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("name"), TopEvents[i].Name);
+		O->SetNumberField(TEXT("outbound_bytes"), static_cast<double>(TopEvents[i].Bits) / 8.0);
+		O->SetNumberField(TEXT("outbound_count"), TopEvents[i].Count);
+		TopEventsJson.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("top_event_types_by_outbound_bandwidth"), TopEventsJson);
 
 	FString OutputString;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
