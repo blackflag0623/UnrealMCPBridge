@@ -603,9 +603,29 @@ FString UTraceAnalysisLibrary::GetTraceNetSummary(const FString& TracePath, int3
 
 	TArray<TSharedPtr<FJsonValue>> GameInstancesJson;
 
-	const uint32 GameInstanceCount = NetProvider->GetGameInstanceCount();
+	// ReadGameInstances returns one entry per state-change snapshot, not one per logical
+	// instance — UE's net profiler is event-sourced. The same GameInstanceId appears
+	// multiple times: e.g., once with empty name (just-created), again named, again with
+	// bIsServer set, etc. Dedupe by GameInstanceId, keeping the snapshot whose
+	// GameInstanceIndex has actual connections (later snapshots are usually populated).
+	// This also silences "LogNetTrace: Connection N is missing" warnings emitted when
+	// EnumeratePackets is called against an empty-snapshot index.
+	TMap<uint32 /*GameInstanceId*/, FNetProfilerGameInstance> InstancesById;
 	NetProvider->ReadGameInstances([&](const FNetProfilerGameInstance& Instance)
 	{
+		const uint32 ConnCount = NetProvider->GetConnectionCount(Instance.GameInstanceIndex);
+		if (ConnCount == 0)
+		{
+			return; // Skip empty/early snapshots — they have no connection data.
+		}
+		// Last-write-wins on ties; UE returns snapshots in chronological order so the
+		// final entry per Id has the latest InstanceName/bIsServer flags.
+		InstancesById.Add(Instance.GameInstanceId, Instance);
+	});
+
+	for (auto& Pair : InstancesById)
+	{
+		const FNetProfilerGameInstance& Instance = Pair.Value;
 		TSharedRef<FJsonObject> InstanceJson = MakeShared<FJsonObject>();
 		InstanceJson->SetStringField(TEXT("name"), Instance.InstanceName ? Instance.InstanceName : TEXT(""));
 		InstanceJson->SetNumberField(TEXT("game_instance_id"), Instance.GameInstanceId);
@@ -714,9 +734,10 @@ FString UTraceAnalysisLibrary::GetTraceNetSummary(const FString& TracePath, int3
 
 		InstanceJson->SetArrayField(TEXT("connections"), ConnectionsJson);
 		GameInstancesJson.Add(MakeShared<FJsonValueObject>(InstanceJson));
-	});
+	}
 
-	Root->SetNumberField(TEXT("game_instance_count"), GameInstanceCount);
+	// game_instance_count = unique logical instances after dedupe (not raw snapshot count).
+	Root->SetNumberField(TEXT("game_instance_count"), InstancesById.Num());
 	Root->SetArrayField(TEXT("game_instances"), GameInstancesJson);
 
 	// Top objects by outbound bandwidth
