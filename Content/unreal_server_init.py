@@ -89,43 +89,163 @@ class MCPUnrealBridge:
 
     @staticmethod
     def modify_actor(actor_name, property_name, property_value):
-        """Modify a property of an existing actor"""
+        """Modify a property of an existing actor.
+
+        Three resolution paths, tried in order:
+          1. Well-known actor setters (ActorLabel, Hidden/bHidden, Location, Rotation, Scale).
+             These don't exist as straight UProperties — they need the engine setter API
+             (set_actor_label, set_actor_hidden_in_game, set_actor_location, ...).
+          2. Dotted property paths (e.g. RootComponent.RelativeLocation). Walks the chain via
+             getattr until the leaf, then setattr / set_editor_property the leaf.
+          3. Fallback: direct setattr / set_editor_property on the actor (the original behavior),
+             for plain top-level UProperties exposed on the Actor class.
+        """
         try:
-            actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem) #unreal.EditorActorSubsystem().get_editor_subsystem()
+            actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
             actors = actor_subsystem.get_all_level_actors()
 
+            target_actor = None
             for actor in actors:
                 if actor.get_name() == actor_name:
-                    # Try to determine property type and convert value
-                    current_value = getattr(actor, property_name, None)
-                    if current_value is not None:
-                        if isinstance(current_value, float):
-                            setattr(actor, property_name, float(property_value))
-                        elif isinstance(current_value, int):
-                            setattr(actor, property_name, int(property_value))
-                        elif isinstance(current_value, bool):
-                            setattr(actor, property_name, property_value.lower() in['true', 'yes', '1'])
-                        elif isinstance(current_value, unreal.Vector):
-                            # Assuming format like "X,Y,Z"
-                            x, y, z = map(float, property_value.split(','))
-                            setattr(actor, property_name, unreal.Vector(x, y, z))
-                        else:
-                            # Default to string
-                            setattr(actor, property_name, property_value)
+                    target_actor = actor
+                    break
+            if target_actor is None:
+                return json.dumps({ "status": "error", "message" : f"Actor '{actor_name}' not found" })
 
-                        return json.dumps({
-                            "status": "success",
-                            "result" : f"Modified {property_name} on {actor_name} to {property_value}"
-                        })
+            # ---- (1) Well-known actor setters --------------------------------------------
+            wk = property_name.lower()
+
+            def _parse_vector(val):
+                # Accepts "X,Y,Z" or "(X=1,Y=2,Z=3)" or "X=1,Y=2,Z=3"
+                s = str(val).strip().strip("()")
+                parts = [p for p in s.replace(" ", "").split(",") if p]
+                nums = []
+                for p in parts:
+                    if "=" in p:
+                        p = p.split("=", 1)[1]
+                    nums.append(float(p))
+                if len(nums) != 3:
+                    raise ValueError(f"expected 3 components for vector, got {len(nums)}")
+                return unreal.Vector(*nums)
+
+            def _parse_rotator(val):
+                s = str(val).strip().strip("()")
+                parts = [p for p in s.replace(" ", "").split(",") if p]
+                nums = {}
+                idx = 0
+                for p in parts:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        nums[k.lower()] = float(v)
                     else:
-                        return json.dumps({
-                            "status": "error",
-                            "message" : f"Property {property_name} not found on {actor_name}"
-                        })
+                        nums[["pitch", "yaw", "roll"][idx]] = float(p)
+                        idx += 1
+                return unreal.Rotator(nums.get("roll", 0.0), nums.get("pitch", 0.0), nums.get("yaw", 0.0))
 
-            return json.dumps({ "status": "error", "message" : f"Actor '{actor_name}' not found" })
+            if wk == "actorlabel":
+                target_actor.set_actor_label(str(property_value))
+                return json.dumps({ "status": "success", "result": f"Set ActorLabel on '{actor_name}' to '{property_value}'" })
+            if wk in ("hidden", "bhidden", "actorhiddeningame"):
+                truthy = str(property_value).lower() in ("true", "yes", "1")
+                target_actor.set_actor_hidden_in_game(truthy)
+                return json.dumps({ "status": "success", "result": f"Set Hidden on '{actor_name}' to {truthy}" })
+            if wk in ("location", "actorlocation"):
+                target_actor.set_actor_location(_parse_vector(property_value), False, True)
+                return json.dumps({ "status": "success", "result": f"Set Location on '{actor_name}' to {property_value}" })
+            if wk in ("rotation", "actorrotation"):
+                target_actor.set_actor_rotation(_parse_rotator(property_value), False)
+                return json.dumps({ "status": "success", "result": f"Set Rotation on '{actor_name}' to {property_value}" })
+            if wk in ("scale", "scale3d", "actorscale", "actorscale3d"):
+                target_actor.set_actor_scale3d(_parse_vector(property_value))
+                return json.dumps({ "status": "success", "result": f"Set Scale on '{actor_name}' to {property_value}" })
+
+            # ---- (2) Dotted-path traversal -----------------------------------------------
+            if "." in property_name:
+                segments = property_name.split(".")
+                obj = target_actor
+                for seg in segments[:-1]:
+                    nxt = getattr(obj, seg, None)
+                    if nxt is None:
+                        # Try editor-property accessor before giving up
+                        try:
+                            nxt = obj.get_editor_property(seg)
+                        except Exception:
+                            nxt = None
+                    if nxt is None:
+                        return json.dumps({ "status": "error",
+                            "message": f"Path segment '{seg}' not found on {type(obj).__name__} (full path: {property_name})" })
+                    obj = nxt
+                leaf_name = segments[-1]
+                current_value = getattr(obj, leaf_name, None)
+                if current_value is None:
+                    try:
+                        current_value = obj.get_editor_property(leaf_name)
+                    except Exception:
+                        current_value = None
+                if current_value is None:
+                    return json.dumps({ "status": "error",
+                        "message": f"Leaf property '{leaf_name}' not found at path '{property_name}'" })
+                converted = MCPUnrealBridge._convert_property_value(current_value, property_value)
+                try:
+                    setattr(obj, leaf_name, converted)
+                except Exception:
+                    obj.set_editor_property(leaf_name, converted)
+                return json.dumps({ "status": "success",
+                    "result": f"Modified {property_name} on {actor_name} to {property_value}" })
+
+            # ---- (3) Fallback: direct setattr / set_editor_property -----------------------
+            current_value = getattr(target_actor, property_name, None)
+            if current_value is None:
+                try:
+                    current_value = target_actor.get_editor_property(property_name)
+                except Exception:
+                    current_value = None
+            if current_value is None:
+                return json.dumps({ "status": "error", "message": f"Property {property_name} not found on {actor_name}" })
+
+            converted = MCPUnrealBridge._convert_property_value(current_value, property_value)
+            try:
+                setattr(target_actor, property_name, converted)
+            except Exception:
+                target_actor.set_editor_property(property_name, converted)
+            return json.dumps({ "status": "success", "result": f"Modified {property_name} on {actor_name} to {property_value}" })
+
         except Exception as e :
             return json.dumps({ "status": "error", "message" : str(e) })
+
+    @staticmethod
+    def _convert_property_value(current_value, property_value):
+        """Coerce a string-form property_value to the type of current_value."""
+        if isinstance(current_value, bool):
+            return str(property_value).lower() in ('true', 'yes', '1')
+        if isinstance(current_value, float):
+            return float(property_value)
+        if isinstance(current_value, int):
+            return int(property_value)
+        if isinstance(current_value, unreal.Vector):
+            s = str(property_value).strip().strip("()")
+            parts = [p for p in s.replace(" ", "").split(",") if p]
+            nums = []
+            for p in parts:
+                if "=" in p:
+                    p = p.split("=", 1)[1]
+                nums.append(float(p))
+            return unreal.Vector(*nums)
+        if isinstance(current_value, unreal.Rotator):
+            s = str(property_value).strip().strip("()")
+            parts = [p for p in s.replace(" ", "").split(",") if p]
+            nums = {}
+            idx = 0
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    nums[k.lower()] = float(v)
+                else:
+                    nums[["pitch", "yaw", "roll"][idx]] = float(p)
+                    idx += 1
+            return unreal.Rotator(nums.get("roll", 0.0), nums.get("pitch", 0.0), nums.get("yaw", 0.0))
+        # Default: string
+        return property_value
 
     @staticmethod
     def get_selected_actors():
@@ -163,8 +283,8 @@ class MCPUnrealBridge:
             if not target_actor:
                 return json.dumps({ "status": "error", "message" : f"Actor '{actor_name}' not found" })
 
-            # Check if it's a static mesh actor
-            if not target_actor.is_a(unreal.StaticMeshActor) :
+            # Check if it's a static mesh actor (UE 5.6+ removed Actor.is_a; use isinstance)
+            if not isinstance(target_actor, unreal.StaticMeshActor) :
                 return json.dumps({
                     "status": "error",
                     "message": f"Actor '{actor_name}' is not a StaticMeshActor"
@@ -291,29 +411,30 @@ class MCPUnrealBridge:
 
     @staticmethod
     def find_assets(asset_name):
-        """Search for specific assets by name, like Floor, Wall, Door"""
-        
-        try:
-            # Search for the asset
-            asset_registry = unreal.AssetRegistryHelpers.get_asset_registry()
-            assets = asset_registry.get_assets_by_path('/Game', recursive=True)
+        """Search for specific assets by name (substring, case-insensitive).
 
-            # Find 
-            tile_asset_paths = []
+        Scans both /Game (project content) and /Engine (engine assets like
+        BasicShapeMaterial, WorldGridMaterial, M_Basic*). Project results sorted first
+        so user-content matches surface above engine matches.
+        """
+        try:
+            asset_registry = unreal.AssetRegistryHelpers.get_asset_registry()
+            game_assets = asset_registry.get_assets_by_path('/Game', recursive=True)
+            engine_assets = asset_registry.get_assets_by_path('/Engine', recursive=True)
+
             asset_name_lower = asset_name.lower()
-            for asset in assets:
+            results = []
+            for asset in list(game_assets) + list(engine_assets):
                 this_name = str(asset.asset_name).lower()
                 if asset_name_lower in this_name:
-                    asset_data = { "asset_class": str(asset.asset_class_path.asset_name), "asset_path": str(asset.package_name)}
-                    tile_asset_paths.append(asset_data)
+                    results.append({
+                        "asset_class": str(asset.asset_class_path.asset_name),
+                        "asset_path": str(asset.package_name),
+                    })
 
-            if not tile_asset_paths:
+            if not results:
                 return json.dumps({ "status": "error", "message": f"Could not find {asset_name} asset." })
-            else:
-                return json.dumps({
-                    "status": "success",
-                    "result" : tile_asset_paths
-                })
+            return json.dumps({ "status": "success", "result" : results })
 
         except Exception as e:
             return json.dumps({ "status": "error", "message": str(e) })

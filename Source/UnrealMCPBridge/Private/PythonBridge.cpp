@@ -8,7 +8,6 @@
 #include <FileHelpers.h>
 #include "Interfaces/IPluginManager.h"
 #include "Async/TaskGraphInterfaces.h"
-#include "Microsoft/MinimalWindowsApi.h"
 #include "Misc/Base64.h"
 
 FString FPythonBridge::LoadFileToString(FString AbsolutePath)

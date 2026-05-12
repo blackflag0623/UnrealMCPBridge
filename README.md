@@ -11,9 +11,16 @@ This allows MCP clients, like Anthropic's [Claude](https://claude.ai/), to acces
 
 ## Prerequisites
 
-- Visual Studio 2019 or higher (if building from code).
+- Python 3.10 or higher available on your system `PATH`, with the official [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) installed:
+
+  ```bash
+  pip install mcp
+  ```
+
+  This is the only Python dependency. The client script `unreal_mcp_client.py` uses `from mcp.server.fastmcp import FastMCP` to expose the bridge tools to your agent. A `MCPClient/requirements.txt` file is provided for convenience (`pip install -r MCPClient/requirements.txt`). Note: this is your *system* Python — the script runs as a subprocess of your agent, not inside the editor's bundled Python.
 - An AI Agent. Below, we assume Claude will be used. But any AI Agent that implements MCP should suffice.
 - Unreal Engine 5 with the Python Editor Script Plugin enabled.
+- Visual Studio 2019 or higher (only needed if building the plugin from source — not required for the Fab install).
 - Note the [Unreal Engine Python API](https://dev.epicgames.com/documentation/en-us/unreal-engine/python-api/?application_version=5.5).
 
 ## Installing from Fab

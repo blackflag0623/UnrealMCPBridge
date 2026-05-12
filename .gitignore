@@ -76,3 +76,8 @@ Plugins/*/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# Python bytecode caches (UE's bundled Python compiles plugin scripts on load)
+__pycache__/
+*.pyc
+*.pyo

@@ -10,9 +10,16 @@ This is a plugin for Unreal Engine (UE) that creates a server implementation of 
 
 ## Prerequisites
 
-- Visual Studio 2019 or higher.
+- Python 3.10 or higher available on your system `PATH`, with the official [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) installed:
+
+  ```bash
+  pip install mcp
+  ```
+
+  This is the only Python dependency. The client script `unreal_mcp_client.py` uses `from mcp.server.fastmcp import FastMCP` to expose the bridge tools to your agent. A `MCPClient/requirements.txt` file is provided for convenience (`pip install -r Plugins/UnrealMCPBridge/MCPClient/requirements.txt`). Note: this is your *system* Python — the script runs as a subprocess of your agent, not inside the editor's bundled Python.
 - An AI Agent. Below, we assume Claude will be used. But any AI Agent that implements MCP should suffice.
 - Unreal Engine 5 with the Python Editor Script Plugin enabled.
+- Visual Studio 2019 or higher (only needed if building the plugin from source — not required for the Fab install).
 - Note the [Unreal Engine Python API](https://dev.epicgames.com/documentation/en-us/unreal-engine/python-api/?application_version=5.7).
 
 ## Installing from GitHub
@@ -142,7 +149,7 @@ These tools are defined in `unreal_mcp_client.py` and are available to the AI ag
 | `get_project_dir` | — | Returns the top-level project directory path (e.g., `D:/MyProject/`). |
 | `get_content_dir` | — | Returns the Content directory path (e.g., `D:/MyProject/Content/`). |
 | `find_basic_shapes` | — | Returns a list of built-in basic shapes (cube, sphere, cylinder, etc.) that can be used for building. |
-| `find_assets` | `asset_name` | Searches the asset registry for assets matching a name. Use keywords like `Floor`, `Wall`, `Door` to discover meshes. |
+| `find_assets` | `asset_name` | Searches the asset registry for assets matching a name (substring, case-insensitive). Scans both `/Game` (project content) and `/Engine` (engine assets like `BasicShapeMaterial`, `WorldGridMaterial`). |
 | `get_asset` | `asset_path` | Returns the bounding box dimensions of a static mesh asset. |
 
 ### Actor Management
@@ -153,7 +160,7 @@ These tools are defined in `unreal_mcp_client.py` and are available to the AI ag
 | `get_actor_details` | `actor_name` | Returns all properties and details for a specific actor by name. |
 | `get_selected_actors` | — | Returns the actors currently selected in the editor viewport. Useful for inspecting what the user is looking at. |
 | `spawn_actor` | `asset_path`, `location_x/y/z`, `rotation_x/y/z`, `scale_x/y/z` | Spawns a static mesh actor at the given location, rotation, and scale. All position/rotation/scale parameters default to 0. |
-| `modify_actor` | `actor_name`, `property_name`, `property_value` | Modifies a property of an existing actor. The value is a string that gets converted to the appropriate type on the server side. |
+| `modify_actor` | `actor_name`, `property_name`, `property_value` | Modifies a property of an existing actor. Three resolution paths, tried in order: (1) well-known actor setters — `ActorLabel`, `Hidden` / `bHidden`, `Location`, `Rotation`, `Scale` — dispatched via the engine setter API; (2) dotted paths like `RootComponent.RelativeLocation` walked segment-by-segment; (3) direct UProperty fallback. Value is a string; converted to bool / int / float / Vector / Rotator based on the leaf property's existing type. Vector / Rotator accept `X,Y,Z`, `(X=1,Y=2,Z=3)`, or `Pitch=0,Yaw=90,Roll=0` style. |
 | `set_material` | `actor_name`, `material_path` | Applies a material to a static mesh actor. Use asset paths like `/Game/Materials/M_MyMaterial`. |
 | `delete_all_static_mesh_actors` | — | Deletes **all** static mesh actors in the scene. Use with caution — this removes everything, not just what was recently placed. |
 
@@ -207,9 +214,9 @@ These tools build BP graphs without `execute_python`. The typical authoring sequ
 | `add_event_node` | `blueprint_path`, `event_name`, `pos_x`, `pos_y` | Adds an event node (e.g., `"ReceiveDestroyed"`). Avoid duplicating BeginPlay/Tick — they already exist on new BPs. |
 | `add_call_function_node` | `blueprint_path`, `target_class_path`, `function_name`, `pos_x`, `pos_y` | Adds a function call. `target_class_path` examples: `/Script/Engine.KismetSystemLibrary`, `/Script/Engine.KismetMathLibrary`, or any BP class path. |
 | `add_spawn_actor_node` | `blueprint_path`, `actor_class_path`, `pos_x`, `pos_y` | Adds the canonical `UK2Node_SpawnActorFromClass`. The class is pinned and `ExposeOnSpawn` properties materialize as input pins automatically. Also auto-spawns a `Make Transform` helper node (KismetMathLibrary call) wired into `SpawnTransform`, because that pin is by-ref and the K2 compiler rejects an unconnected one. Edit the Make Transform's Location/Rotation/Scale sub-pins to set a non-identity spawn transform, or replace it with your own input. |
-| `add_variable_get_node` | `blueprint_path`, `variable_name`, `pos_x`, `pos_y` | Adds a variable Get node. Variable must already exist (via `add_variable`). |
-| `add_variable_set_node` | `blueprint_path`, `variable_name`, `pos_x`, `pos_y` | Adds a variable Set node. Variable must already exist. |
-| `add_branch_node` | `blueprint_path`, `pos_x`, `pos_y` | Adds an if/else `Branch` node. |
+| `add_variable_get_node` | `blueprint_path`, `variable_name`, `pos_x`, `pos_y` | Adds a variable Get node. Variable must already exist (via `add_variable`). Returns the post-insert node ID — safe to pass directly to `connect_pins`. |
+| `add_variable_set_node` | `blueprint_path`, `variable_name`, `pos_x`, `pos_y` | Adds a variable Set node. Variable must already exist. Returns the post-insert node ID. |
+| `add_branch_node` | `blueprint_path`, `pos_x`, `pos_y` | Adds an if/else `Branch` node. Returns the post-insert node ID. |
 | `add_custom_event_node` | `blueprint_path`, `event_name`, `pos_x`, `pos_y` | Adds a Custom Event entry point callable from BP code. |
 | `connect_pins` | `blueprint_path`, `source_node_id`, `source_pin`, `target_node_id`, `target_pin` | Wires two pins (exec or data). Use the internal pin names (`"then"`, `"execute"`, `"ReturnValue"`, etc.) — call `get_pin_names` first if unsure. |
 | `set_pin_default_value` | `blueprint_path`, `node_id`, `pin_name`, `value` | Sets a literal default on an unconnected input. For object/class pins pass an asset path (`"/Game/BP/BP_NPC.BP_NPC_C"`). |

@@ -381,12 +381,16 @@ FString UBlueprintGraphLibrary::AddVariableGetNode(
 	FEdGraphSchemaAction_K2NewNode Action;
 	Action.NodeTemplate = Node;
 	UEdGraphPin* NullPin = nullptr;
-	Action.PerformAction(EventGraph, NullPin, FGraphNodePosition(PosX, PosY));
+	// PerformAction duplicates the template into the graph and renames the duplicate
+	// if the template's name collides with an existing node. Return the inserted
+	// node's name (post-rename), not the template's pre-insert name.
+	UEdGraphNode* CreatedNode = Action.PerformAction(EventGraph, NullPin, FGraphNodePosition(PosX, PosY));
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	UE_LOG(LogTemp, Display, TEXT("[BlueprintGraphLib] Added variable get node: %s -> %s"), *VariableName, *Node->GetName());
-	return Node->GetName();
+	const FString FinalName = CreatedNode ? CreatedNode->GetName() : Node->GetName();
+	UE_LOG(LogTemp, Display, TEXT("[BlueprintGraphLib] Added variable get node: %s -> %s"), *VariableName, *FinalName);
+	return FinalName;
 }
 
 FString UBlueprintGraphLibrary::AddVariableSetNode(
@@ -414,12 +418,13 @@ FString UBlueprintGraphLibrary::AddVariableSetNode(
 	FEdGraphSchemaAction_K2NewNode Action;
 	Action.NodeTemplate = Node;
 	UEdGraphPin* NullPin = nullptr;
-	Action.PerformAction(EventGraph, NullPin, FGraphNodePosition(PosX, PosY));
+	UEdGraphNode* CreatedNode = Action.PerformAction(EventGraph, NullPin, FGraphNodePosition(PosX, PosY));
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	UE_LOG(LogTemp, Display, TEXT("[BlueprintGraphLib] Added variable set node: %s -> %s"), *VariableName, *Node->GetName());
-	return Node->GetName();
+	const FString FinalName = CreatedNode ? CreatedNode->GetName() : Node->GetName();
+	UE_LOG(LogTemp, Display, TEXT("[BlueprintGraphLib] Added variable set node: %s -> %s"), *VariableName, *FinalName);
+	return FinalName;
 }
 
 FString UBlueprintGraphLibrary::AddBranchNode(
@@ -445,12 +450,13 @@ FString UBlueprintGraphLibrary::AddBranchNode(
 	FEdGraphSchemaAction_K2NewNode Action;
 	Action.NodeTemplate = Node;
 	UEdGraphPin* NullPin = nullptr;
-	Action.PerformAction(EventGraph, NullPin, FGraphNodePosition(PosX, PosY));
+	UEdGraphNode* CreatedNode = Action.PerformAction(EventGraph, NullPin, FGraphNodePosition(PosX, PosY));
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	UE_LOG(LogTemp, Display, TEXT("[BlueprintGraphLib] Added branch node -> %s"), *Node->GetName());
-	return Node->GetName();
+	const FString FinalName = CreatedNode ? CreatedNode->GetName() : Node->GetName();
+	UE_LOG(LogTemp, Display, TEXT("[BlueprintGraphLib] Added branch node -> %s"), *FinalName);
+	return FinalName;
 }
 
 FString UBlueprintGraphLibrary::AddCustomEventNode(

@@ -1,0 +1,10 @@
+# UnrealMCPBridge -- Python client dependencies.
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# This file lists what `unreal_mcp_client.py` needs to run. The `mcp` package
+# is the official MCP Python SDK from https://github.com/modelcontextprotocol/python-sdk.
+# Pin a minimum version compatible with the FastMCP API used by the client.
+
+mcp>=1.0
