@@ -284,10 +284,15 @@ def find_basic_shapes():
 @mcp.tool()
 def find_assets(asset_name: str) -> str:
     """
-    Search for specific assets by name, like Floor, Wall, Door.
+    Search for assets by name (case-insensitive substring) across both
+    /Game (project content) and /Engine (engine assets).
+
+    Returns a JSON list of matches: [{"asset_class": ..., "asset_path": ...}, ...].
+    Common substrings (e.g. "Material") can return many results — prefer a
+    more specific fragment when possible. Project (/Game) hits are listed first.
 
     Args:
-        asset_name: Name of asset file on disk
+        asset_name: Substring to match against asset short names
     """
     result = send_command("find_assets", {
         "asset_name": asset_name

@@ -56,8 +56,8 @@ class MCPUnrealBridge:
                 break
 
         if not result:
-            result = f"Actor not found: {actor_name}"
-        
+            return json.dumps({"status": "error", "message": f"Actor '{actor_name}' not found"})
+
         return json.dumps({"status": "success", "result": result})
     
     @staticmethod
