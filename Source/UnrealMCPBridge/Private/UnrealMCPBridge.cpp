@@ -7,6 +7,7 @@
 #include "ToolMenus.h"
 #include "MCPSocketServer.h"
 #include "PythonBridge.h"
+#include "Containers/Ticker.h"
 
 static const FName UnrealMCPBridgeTabName("UnrealMCPBridge");
 
@@ -30,10 +31,27 @@ void FUnrealMCPBridgeModule::StartupModule()
 
 	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FUnrealMCPBridgeModule::RegisterMenus));
 
-	// Start the socket server when the module loads
-    //SocketServer = new FMCPSocketServer();
-    //SocketServer->Start();
+	AutoStartTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateRaw(this, &FUnrealMCPBridgeModule::AutoStartBridge),
+		5.0f);
 
+}
+
+bool FUnrealMCPBridgeModule::AutoStartBridge(float DeltaTime)
+{
+	if (IsRunningCommandlet())
+	{
+		return false;
+	}
+
+	RestartSocketServer();
+	if (!FPythonBridge::bIsInitialized)
+	{
+		FPythonBridge::Initialize();
+	}
+
+	UE_LOG(LogTemp, Display, TEXT("UnrealMCPBridge auto-started on editor startup."));
+	return false;
 }
 
 void FUnrealMCPBridgeModule::RestartSocketServer()
@@ -64,6 +82,12 @@ void FUnrealMCPBridgeModule::ShutdownModule()
 
     // Clean up Python bridge
     FPythonBridge::Shutdown();
+
+	if (AutoStartTickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(AutoStartTickerHandle);
+		AutoStartTickerHandle.Reset();
+	}
 
 	UToolMenus::UnRegisterStartupCallback(this);
 

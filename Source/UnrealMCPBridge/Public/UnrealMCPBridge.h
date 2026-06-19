@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "Modules/ModuleManager.h"
 
 class FToolBarBuilder;
@@ -25,8 +26,10 @@ private:
 	class FMCPSocketServer* SocketServer;
 
 	void RegisterMenus();
+	bool AutoStartBridge(float DeltaTime);
 
 
 private:
 	TSharedPtr<class FUICommandList> PluginCommands;
+	FTSTicker::FDelegateHandle AutoStartTickerHandle;
 };
