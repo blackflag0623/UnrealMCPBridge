@@ -56,11 +56,13 @@ void FPythonBridge::Initialize()
 
 void FPythonBridge::Shutdown()
 {
-    // Clean up any Python resources
-    FString ShutdownScript = TEXT("del mcp_bridge");
-    //FPythonScriptPlugin::Get()->ExecPythonCommand(*ShutdownScript);
-    IPythonScriptPlugin::Get()->ExecPythonCommand(*ShutdownScript);
-    UE_LOG(LogTemp, Display, TEXT("Python bridge shut down"));
+    if (!bIsInitialized)
+    {
+        return;
+    }
+
+    bIsInitialized = false;
+    UE_LOG(LogTemp, Display, TEXT("Python bridge marked shut down"));
 }
 
 FString FPythonBridge::ExecuteCommand(const FString& Command, TSharedPtr<FJsonObject> Params)
