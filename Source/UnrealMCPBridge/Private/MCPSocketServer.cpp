@@ -145,6 +145,7 @@ void FMCPSocketServer::HandleClientConnection(FSocket* ClientSocket)
                     // Convert to FString and process
                     FString ReceivedData = UTF8_TO_TCHAR(reinterpret_cast<ANSICHAR*>(RecvBuffer.GetData()));
                     ProcessClientMessage(ClientSocket, ReceivedData);
+                    break;
                 }
             }
         }
